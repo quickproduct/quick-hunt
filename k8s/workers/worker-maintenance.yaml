@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-maintenance
+  namespace: job-hunter
+  labels:
+    app: worker-maintenance
+    worker-type: maintenance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-maintenance
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: worker-maintenance
+    spec:
+      terminationGracePeriodSeconds: 1980
+      containers:
+        - name: worker
+          image: k3d-jh-registry:5050/jh-worker-lightweight:local
+          command:
+            - celery
+            - -A
+            - services.scraper.celery_app
+            - worker
+            - --loglevel=warning
+            - --concurrency=4
+            - -Q
+            - jh_jobs_maintenance
+            - -Ofair
+            - -E
+            - --without-mingle
+            - --without-gossip
+            - --max-tasks-per-child=500
+            - --hostname=maintenance-%(n)s@%h
+          env:
+            - name: SERVICE_NAME
+              value: "worker-maintenance"
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "30m"
+            limits:
+              memory: "512Mi"
+              cpu: "100m"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-maintenance-scaler
+  namespace: job-hunter
+spec:
+  scaleTargetRef:
+    name: worker-maintenance
+  pollingInterval: 15  # Low urgency — check every minute
+  cooldownPeriod: 60
+  minReplicaCount: 1
+  maxReplicaCount: 3   # Maintenance tasks should not fan out aggressively
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_jobs_maintenance
+        mode: QueueLength
+        value: "20"
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq

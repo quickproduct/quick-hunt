@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "job-hunter-admin": {
+      "command": "/Users/suraj/code/Product/job-automtion/ai-job-hunter/mcp/.venv/bin/python",
+      "args": [
+        "/Users/suraj/code/Product/job-automtion/ai-job-hunter/mcp/admin_server.py"
+      ],
+      "env": {
+        "JH_API_URL": "http://localhost:8001",
+        "JH_ADMIN_API_KEY": "AIzaSyDoQJy6Etha-Nltrc6-RfOh1iXh9P6WGU4",
+        "JH_REDIS_URL": "redis://localhost:6379/0",
+        "JH_RABBITMQ_URL": "http://localhost:15672",
+        "JH_RABBITMQ_USER": "jobhunter",
+        "JH_RABBITMQ_PASS": "jobhunter"
+      }
+    }
+  }
+}

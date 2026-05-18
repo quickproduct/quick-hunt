@@ -1,0 +1,31 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements files before source for better layer caching
+COPY backend/requirements-shared.txt ./backend/requirements-shared.txt
+COPY backend/services/api/requirements.txt ./backend/services/api/requirements.txt
+
+# Install dependencies
+RUN pip install --no-cache-dir \
+    -r backend/requirements-shared.txt \
+    -r backend/services/api/requirements.txt
+
+# Copy source
+COPY backend/services/ ./backend/services/
+COPY backend/alembic/ ./backend/alembic/
+COPY backend/alembic.ini ./backend/alembic.ini
+
+ENV PYTHONPATH=/app/backend
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8000
+
+CMD ["uvicorn", "services.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

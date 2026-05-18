@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-scraping-realtime
+  namespace: job-hunter
+  labels:
+    app: worker-scraping-realtime
+    worker-type: scraping
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-scraping-realtime
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: worker-scraping-realtime
+    spec:
+      terminationGracePeriodSeconds: 1980
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi  # Playwright browser peaks at ~800MB SHM under load
+      containers:
+        - name: worker
+          image: k3d-jh-registry:5050/jh-worker-playwright:local
+          command:
+            - celery
+            - -A
+            - services.scraper.celery_app
+            - worker
+            - --loglevel=warning
+            - --concurrency=1
+            - -Q
+            - jh_scraping_realtime
+            - -Ofair
+            - -E
+            - --without-mingle
+            - --without-gossip
+            - --max-tasks-per-child=50
+            - --hostname=scraping-realtime-%(n)s@%h
+          env:
+            - name: SERVICE_NAME
+              value: "worker-scraping-realtime"
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "2Gi"  # Playwright peaks at 1-1.3GB process + 1GB SHM under real scraping
+              cpu: "1000m"
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", "pgrep -f 'celery.*worker' > /dev/null"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-scraping-realtime-scaler
+  namespace: job-hunter
+spec:
+  scaleTargetRef:
+    name: worker-scraping-realtime
+  pollingInterval: 5  # Fast polling — latency-sensitive
+  cooldownPeriod: 45
+  minReplicaCount: 1
+  maxReplicaCount: 2   # 8GB node; Playwright too heavy to run multiple instances
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_scraping_realtime
+        mode: QueueLength
+        value: "5"
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq

@@ -1,0 +1,89 @@
+# Traefik ingress — bundled with k3s, no extra install needed.
+# Replace CHANGE_ME_DOMAIN with your actual domain (e.g., jobs.yourdomain.com).
+#
+# TLS: install cert-manager first, then annotate with cert-manager.io/cluster-issuer.
+# Quick cert-manager install:
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+#   # Then create a ClusterIssuer for Let's Encrypt (see below)
+
+# SSE streaming middleware — disables response buffering for /api/stream/* endpoints
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: sse-no-buffer
+  namespace: job-hunter
+spec:
+  headers:
+    customResponseHeaders:
+      X-Accel-Buffering: "no"
+      Cache-Control: "no-cache, no-store"
+      Connection: "keep-alive"
+---
+# Security headers middleware
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: security-headers
+  namespace: job-hunter
+spec:
+  headers:
+    frameDeny: true
+    browserXssFilter: true
+    contentTypeNosniff: true
+    forceSTSHeader: true
+    stsSeconds: 31536000
+---
+# Main ingress routing: /api/* → FastAPI, /* → Next.js dashboard
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: job-hunter-ingress
+  namespace: job-hunter
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    # Uncomment after cert-manager is installed:
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    # Apply SSE middleware to streaming endpoints
+    traefik.ingress.kubernetes.io/router.middlewares: job-hunter-security-headers@kubernetescrd
+spec:
+  # Uncomment after cert-manager is configured:
+  # tls:
+  #   - hosts:
+  #       - CHANGE_ME_DOMAIN
+  #     secretName: job-hunter-tls
+  rules:
+    - host: CHANGE_ME_DOMAIN
+      http:
+        paths:
+          - path: /api/
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dashboard
+                port:
+                  number: 3000
+---
+# Let's Encrypt ClusterIssuer — apply after cert-manager is installed
+# kubectl apply -f k8s/ingress/ingress.yaml
+# apiVersion: cert-manager.io/v1
+# kind: ClusterIssuer
+# metadata:
+#   name: letsencrypt-prod
+# spec:
+#   acme:
+#     server: https://acme-v02.api.letsencrypt.org/directory
+#     email: CHANGE_ME_EMAIL
+#     privateKeySecretRef:
+#       name: letsencrypt-prod
+#     solvers:
+#       - http01:
+#           ingress:
+#             class: traefik

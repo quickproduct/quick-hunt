@@ -1,0 +1,614 @@
+# Production Docker Compose — VPS (4 CPU / 8 GB RAM)
+#
+# Key differences from docker-compose.yml (dev):
+#   - No source code volume mounts — code is baked into images at build time
+#   - Only port 80 exposed to host (nginx); all other ports are internal
+#   - restart: always throughout
+#   - Worker replicas reduced to 1 (scale up with: docker compose ... up -d --scale worker-xyz=2)
+#   - Memory limits tuned to fit ~5.6GB within 8GB VPS
+#   - Nginx container handles routing: /api/* → FastAPI, / → Next.js
+#
+# Usage:
+#   cp .env.prod.example .env.prod && nano .env.prod
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod build
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+# First-run only — pull Ollama model after ollama container is healthy:
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod exec ollama ollama pull nomic-embed-text
+
+services:
+  # ── Local Infrastructure ──────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres
+    mem_limit: 512m
+    command: >
+      postgres
+      -c max_connections=400
+      -c shared_buffers=128MB
+      -c checkpoint_completion_target=0.9
+      -c max_wal_size=2GB
+      -c min_wal_size=256MB
+      -c wal_buffers=16MB
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-jobhunter}
+      POSTGRES_USER: ${POSTGRES_USER:-jobhunter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jobhunter} -d ${POSTGRES_DB:-jobhunter}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: always
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq
+    mem_limit: 256m
+    ports:
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-jobhunter}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+      RABBITMQ_DEFAULT_VHOST: /
+      RABBITMQ_HEARTBEAT: 600
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    mem_limit: 256m
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: always
+
+  # ── Watchtower: restart exited containers (no auto-pull in prod) ──────────
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      DOCKER_API_VERSION: "1.40"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "300"
+      WATCHTOWER_INCLUDE_STOPPED: "true"
+      WATCHTOWER_REVIVE_STOPPED: "true"
+      WATCHTOWER_NO_PULL: "true"
+      WATCHTOWER_ROLLING_RESTART: "true"
+      WATCHTOWER_LABEL_ENABLE: "true"
+    restart: always
+
+  # ── Alembic migrations (run once, then exits) ─────────────────────────────
+  alembic:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    container_name: alembic-migrations
+    env_file: ./.env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: alembic -c backend/alembic.ini upgrade head
+    restart: "no"
+
+  # ── FastAPI backend ───────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    container_name: Backend
+    env_file: ./.env.prod
+    restart: always
+    mem_limit: 768m
+    cpus: 2.0
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    environment:
+      SERVICE_NAME: "api"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+    volumes:
+      - /root/job-automation/backend/logs:/app/backend/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: uvicorn services.api.main:app --host 0.0.0.0 --port 8000
+
+  # ── Next.js dashboard ─────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.dashboard
+      args:
+        NEXT_PUBLIC_ADMIN_API_KEY: "${NEXT_PUBLIC_ADMIN_API_KEY}"
+    container_name: Frontend
+    env_file: ./.env.prod
+    mem_limit: 128m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    depends_on:
+      - api
+
+  # ── Nginx reverse proxy ───────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx
+    mem_limit: 64m
+    ports:
+      - "8090:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+      - dashboard
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    restart: always
+
+  # ── Ollama (local embeddings) ─────────────────────────────────────────────
+  # First run: docker compose ... exec ollama ollama pull nomic-embed-text
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    cpus: 1.5
+    mem_limit: 2500m
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: always
+
+  # ── Worker: jh_scraping_bulk ─────────────────────────────────────────────
+  worker-scraping-bulk:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    shm_size: "1g"
+    cpus: 1.0
+    mem_limit: 1g
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_SCRAPING_BULK_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-scraping-bulk"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_SCRAPING_BULK_CONCURRENCY:-2}
+      -Q jh_scraping_bulk
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=scraping-bulk-%n
+
+  # ── Worker: jh_scraping_realtime ─────────────────────────────────────────
+  worker-scraping-realtime:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    shm_size: "1g"
+    cpus: 1.0
+    mem_limit: 2g
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_SCRAPING_REALTIME_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-scraping-realtime"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_SCRAPING_REALTIME_CONCURRENCY:-2}
+      -Q jh_scraping_realtime
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=scraping-rt-%n
+
+  # ── Worker: jh_scraping_enrichment ───────────────────────────────────────
+  worker-enrichment:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    cpus: 0.5
+    mem_limit: 384m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_ENRICHMENT_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-enrichment"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      WORKER_ENRICHMENT_CONCURRENCY: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_ENRICHMENT_CONCURRENCY:-4}
+      -Q jh_scraping_enrichment
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=enrichment-%n
+
+  # ── Worker: jh_jobs_maintenance ──────────────────────────────────────────
+  worker-maintenance:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    cpus: 0.25
+    mem_limit: 256m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_MAINTENANCE_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-maintenance"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_MAINTENANCE_CONCURRENCY:-2}
+      -Q jh_jobs_maintenance
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=maintenance-%n
+
+  # ── Worker: jh_cover_letter_bulk ─────────────────────────────────────────
+  worker-cover-bulk:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    cpus: 0.25
+    mem_limit: 256m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_COVER_BULK_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-cover-bulk"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_COVER_BULK_CONCURRENCY:-2}
+      -Q jh_cover_letter_bulk
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=cover-bulk-%n
+
+  # ── Worker: jh_cover_letter_ranking ──────────────────────────────────────
+  worker-cover-ranking:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    cpus: 0.25
+    mem_limit: 256m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_COVER_RANKING_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-cover-ranking"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_COVER_RANKING_CONCURRENCY:-2}
+      -Q jh_cover_letter_ranking
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=ranking-%n
+
+  # ── Worker: jh_cover_letter_generation ───────────────────────────────────
+  worker-cover-generation:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    cpus: 0.5
+    mem_limit: 256m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_COVER_GENERATION_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-cover-generation"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+    volumes:
+      - /root/job-automation/backend/logs:/app/backend/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_COVER_GENERATION_CONCURRENCY:-2}
+      -Q jh_cover_letter_generation,jh_embeddings
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=50
+      --hostname=generation-%n
+
+  # ── Worker: jh_cover_letter_workflow ─────────────────────────────────────
+  worker-cover-workflow:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    cpus: 0.25
+    mem_limit: 256m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_COVER_WORKFLOW_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-cover-workflow"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_COVER_WORKFLOW_CONCURRENCY:-2}
+      -Q jh_cover_letter_workflow
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=workflow-%n
+
+  # ── Worker: jh_email_send + jh_email_retry ───────────────────────────────
+  worker-email:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    cpus: 0.25
+    mem_limit: 256m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_EMAIL_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-email"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+    volumes:
+      - /root/job-automation/backend/logs:/app/backend/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=${WORKER_EMAIL_CONCURRENCY:-2}
+      -Q jh_email_send,jh_email_retry
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=email-%n
+
+  # ── Worker: jh_cover_letter_batch ────────────────────────────────────────
+  # Single replica intentional — rate limiter is per-key
+  worker-cover-batch:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    cpus: 0.25
+    mem_limit: 128m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: 1
+    environment:
+      SERVICE_NAME: "worker-cover-batch"
+      ENVIRONMENT: "production"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-warning}
+      --concurrency=1
+      --prefetch-multiplier=1
+      -Q jh_cover_letter_batch
+      -Ofair
+      -E --without-mingle --without-gossip
+      --hostname=cover-batch-%n
+
+  # ── Beat scheduler ────────────────────────────────────────────────────────
+  beat:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env.prod
+    container_name: Scheduler
+    mem_limit: 128m
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    environment:
+      SERVICE_NAME: "beat"
+      ENVIRONMENT: "production"
+      LOG_TO_FILE: "false"
+      OTEL_SDK_DISABLED: "true"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A services.scraper.celery_app beat --loglevel=info
+
+  # ── Docker control agent ──────────────────────────────────────────────────
+  # Admin sidecar: listens on Redis channel admin:docker:commands for scale/restart ops
+  docker-agent:
+    image: python:3.11-slim
+    container_name: docker-agent
+    working_dir: /app
+    env_file: ./.env.prod
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker-compose.prod.yml:/app/docker-compose.yml:ro
+      - ./docker_agent.py:/app/docker_agent.py:ro
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "pip install redis[hiredis] -q && python docker_agent.py"
+
+volumes:
+  pg_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  redis_data:
+    driver: local
+  ollama_data:
+    driver: local

@@ -1,0 +1,87 @@
+workers:
+  scraping_bulk:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_scraping_bulk
+    broker: rabbitmq
+  scraping_realtime:
+    scale: 2
+    concurrency: 2
+    queues:
+    - jh_scraping_realtime
+    broker: rabbitmq
+  enrichment:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_scraping_enrichment
+    broker: rabbitmq
+  maintenance:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_jobs_maintenance
+    broker: redis
+  cover_bulk:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_cover_letter_bulk
+    broker: redis
+  cover_ranking:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_cover_letter_ranking
+    broker: redis
+  cover_generation:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_cover_letter_generation
+    - jh_embeddings
+    broker: redis
+  cover_workflow:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_cover_letter_workflow
+    broker: redis
+  email:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_email_send
+    - jh_email_retry
+    broker: redis
+  cover_batch:
+    scale: 1
+    concurrency: 1
+    queues:
+    - jh_cover_letter_batch
+    broker: redis
+    locked: true
+broker:
+  primary: rabbitmq
+  pool_limit: 3
+tasks:
+  prefetch_multiplier: 1
+  soft_time_limit: 1800
+  hard_time_limit: 1920
+beat_schedule:
+  scrape_interval_hours: 2
+  refresh_covers_interval_hours: 4
+  backfill_emails_interval_minutes: 15
+  fill_missing_covers_interval_minutes: 15
+  deduplicate_interval_minutes: 15
+  stale_lock_reaper_interval_minutes: 20
+  pipeline_health_check_interval_minutes: 15
+  purge_irrelevant_interval_minutes: 15
+  fix_placeholder_emails_interval_minutes: 30
+  retry_failed_sends_interval_minutes: 30
+  dispatch_ready_interval_minutes: 5
+  auto_approve_interval_minutes: 10
+  cleanup_old_jobs_interval_days: 7
+logging:
+  level: INFO

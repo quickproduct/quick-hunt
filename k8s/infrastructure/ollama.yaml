@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: job-hunter
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  strategy:
+    type: Recreate  # Only one instance; Recreate avoids PVC multi-attach issues
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      # Pull nomic-embed-text model on first run:
+      #   kubectl exec -n job-hunter deploy/ollama -- ollama pull nomic-embed-text
+      initContainers:
+        - name: model-pull
+          image: ollama/ollama:latest
+          command: ["sh", "-c", "ollama serve & sleep 5 && ollama pull nomic-embed-text || true"]
+          volumeMounts:
+            - name: ollama-data
+              mountPath: /root/.ollama
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          ports:
+            - containerPort: 11434
+          volumeMounts:
+            - name: ollama-data
+              mountPath: /root/.ollama
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 11434
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: 11434
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: ollama-data
+          persistentVolumeClaim:
+            claimName: ollama-data-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-data-pvc
+  namespace: job-hunter
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi  # nomic-embed-text ~274MB; room for additional models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: job-hunter
+  labels:
+    app: ollama
+spec:
+  selector:
+    app: ollama
+  ports:
+    - port: 11434
+      targetPort: 11434

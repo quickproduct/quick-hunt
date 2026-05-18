@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+  namespace: job-hunter
+  labels:
+    app: dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dashboard
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: dashboard
+    spec:
+      containers:
+        - name: dashboard
+          image: k3d-jh-registry:5050/jh-dashboard:local
+          ports:
+            - containerPort: 3000
+          env:
+            - name: HOSTNAME
+              value: "0.0.0.0"  # Force Next.js standalone to bind all interfaces
+            - name: NEXT_PUBLIC_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: job-hunter-config
+                  key: FRONTEND_URL
+            - name: NEXT_PUBLIC_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: job-hunter-secrets
+                  key: NEXT_PUBLIC_ADMIN_API_KEY
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+  namespace: job-hunter
+  labels:
+    app: dashboard
+spec:
+  selector:
+    app: dashboard
+  ports:
+    - port: 3000
+      targetPort: 3000

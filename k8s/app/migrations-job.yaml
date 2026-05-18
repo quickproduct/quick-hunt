@@ -1,0 +1,39 @@
+# One-shot Kubernetes Job: runs alembic upgrade head then exits.
+# Apply before starting api or workers.
+# Usage:
+#   kubectl apply -f k8s/app/migrations-job.yaml
+#   kubectl wait --for=condition=complete job/alembic-migrations -n job-hunter --timeout=300s
+#   kubectl logs job/alembic-migrations -n job-hunter
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alembic-migrations
+  namespace: job-hunter
+spec:
+  ttlSecondsAfterFinished: 300  # Auto-delete pod after 5 min so it doesn't clutter
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: alembic
+          image: k3d-jh-registry:5050/jh-api:local
+          command:
+            - alembic
+            - -c
+            - backend/alembic.ini
+            - upgrade
+            - head
+          workingDir: /app
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "300m"

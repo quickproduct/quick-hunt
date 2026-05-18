@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-config
+  namespace: job-hunter
+data:
+  rabbitmq.conf: |
+    # Matches infra/rabbitmq/rabbitmq.conf — prevents PRECONDITION_FAILED
+    # channel closures during 30-min Celery tasks
+    consumer_timeout = 7200000
+    vm_memory_high_watermark.relative = 0.6
+    disk_free_limit.absolute = 512MB
+    log.console.level = warning
+  enabled_plugins: |
+    [rabbitmq_management,rabbitmq_prometheus].
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: job-hunter
+  labels:
+    app: rabbitmq
+spec:
+  serviceName: rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15692"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.13-management-alpine
+          ports:
+            - name: amqp
+              containerPort: 5672
+            - name: management
+              containerPort: 15672
+            - name: prometheus
+              containerPort: 15692
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: job-hunter-config
+                  key: RABBITMQ_DEFAULT_USER
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: job-hunter-secrets
+                  key: RABBITMQ_DEFAULT_PASS
+          volumeMounts:
+            - name: rabbitmq-data
+              mountPath: /var/lib/rabbitmq
+            - name: rabbitmq-config-vol
+              mountPath: /etc/rabbitmq/rabbitmq.conf
+              subPath: rabbitmq.conf
+            - name: rabbitmq-config-vol
+              mountPath: /etc/rabbitmq/enabled_plugins
+              subPath: enabled_plugins
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "300m"
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "ping"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "check_port_connectivity"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+      volumes:
+        - name: rabbitmq-config-vol
+          configMap:
+            name: rabbitmq-config
+  volumeClaimTemplates:
+    - metadata:
+        name: rabbitmq-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: job-hunter
+  labels:
+    app: rabbitmq
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+    - name: management
+      port: 15672
+      targetPort: 15672
+    - name: prometheus
+      port: 15692
+      targetPort: 15692
+  clusterIP: None  # Headless — stable DNS: rabbitmq.job-hunter.svc.cluster.local

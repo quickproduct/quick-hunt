@@ -1,0 +1,672 @@
+# Local infrastructure — all services run as Docker containers.
+# Configure credentials and keys in infra/.env (copy from infra/.env.example).
+#
+# Optional external services (cloud alternatives, configure in infra/.env):
+#   Database  : Neon PostgreSQL   (set DATABASE_URL + POSTGRES_LOCAL=false)
+#   Redis     : Upstash Redis     (set REDIS_URL / CELERY_RESULT_BACKEND to rediss://)
+#   RabbitMQ  : CloudAMQP         (set RABBITMQ_URL to amqps://)
+#   Storage   : Cloudflare R2     (set S3_* vars)
+#
+# Worker queue routing:
+#   Scraping workers  → RabbitMQ  (jh_scraping_bulk / realtime / enrichment)
+#   AI/email workers  → Redis     (jh_cover_letter_* / jh_email_* / jh_jobs_maintenance)
+#   beat              → dispatches to both brokers
+
+services:
+  # ── Local Infrastructure (replaces Neon, CloudAMQP, Upstash) ─────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres
+    mem_limit: 512m
+    command: >
+      postgres
+      -c max_connections=400
+      -c shared_buffers=128MB
+      -c checkpoint_completion_target=0.9
+      -c max_wal_size=2GB
+      -c min_wal_size=256MB
+      -c wal_buffers=16MB
+    environment:
+      POSTGRES_DB: jobhunter
+      POSTGRES_USER: jobhunter
+      POSTGRES_PASSWORD: jobhunter
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobhunter -d jobhunter"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rabbitmq
+    mem_limit: 512m
+    environment:
+      RABBITMQ_DEFAULT_USER: jobhunter
+      RABBITMQ_DEFAULT_PASS: jobhunter
+      RABBITMQ_DEFAULT_VHOST: /
+      RABBITMQ_HEARTBEAT: 600
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      # Mount enabled_plugins as read-only so RabbitMQ reads our plugin list without
+      # trying to write to the file (avoids permission error on existing volumes).
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      # Custom config: raises consumer_timeout (default 30 min) to 2 h so that
+      # long-running Celery scraping tasks (soft-limit 30 min) don't trigger
+      # PRECONDITION_FAILED channel closures that kill all queue consumers.
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI
+      - "15692:15692"   # Prometheus metrics
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    mem_limit: 512m
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Watchtower: Container restart monitoring ───────────────────────────────
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      DOCKER_API_VERSION: "1.40"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: "30"
+      WATCHTOWER_INCLUDE_STOPPED: "true"
+      WATCHTOWER_REVIVE_STOPPED: "true"
+      WATCHTOWER_NO_PULL: "true"
+      WATCHTOWER_ROLLING_RESTART: "true"
+      WATCHTOWER_LABEL_ENABLE: "true"
+    restart: unless-stopped
+
+  # ── Alembic migrations ────────────────────────────────────────────────────
+  alembic:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    container_name: alembic-migrations
+    env_file: ./.env
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: alembic -c backend/alembic.ini upgrade head
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    container_name: Backend
+    ports:
+      - "8001:8000"
+    env_file: ./.env
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 2.0
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    environment:
+      SERVICE_NAME: "api"
+      OTEL_SDK_DISABLED: "true"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+      - ../infra:/app/infra
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    command: uvicorn services.api.main:app --host 0.0.0.0 --port 8000
+
+  # ── Worker: jh_scraping_bulk ─────────────────────────────────────────────────
+  # Tasks: scheduled_scrape  (high-volume, runs every 10 min via beat)
+  worker-scraping-bulk:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    shm_size: "2g"
+    cpus: 1.0
+    mem_limit: 1g
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_SCRAPING_BULK_SCALE:-2}
+    environment:
+      SERVICE_NAME: "worker-scraping-bulk"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_SCRAPING_BULK_CONCURRENCY:-2}
+      -Q jh_scraping_bulk
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=scraping-bulk-%n
+
+  # ── Worker: jh_scraping_realtime ─────────────────────────────────────────────
+  # Tasks: scrape_portal_task  (on-demand, single portal, fast response)
+  worker-scraping-realtime:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    shm_size: "2g"
+    cpus: 1.0
+    mem_limit: 2g
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_SCRAPING_REALTIME_SCALE:-2}
+    environment:
+      SERVICE_NAME: "worker-scraping-realtime"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_SCRAPING_REALTIME_CONCURRENCY:-2}
+      -Q jh_scraping_realtime
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=scraping-rt-%n
+
+  # ── Worker: jh_scraping_enrichment ───────────────────────────────────────────
+  # Tasks: backfill_hr_emails_task, fix_placeholder_emails_task
+  worker-enrichment:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    cpus: 0.5
+    mem_limit: 512m
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_ENRICHMENT_SCALE:-3}
+    environment:
+      SERVICE_NAME: "worker-enrichment"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_ENRICHMENT_CONCURRENCY:-4}
+      -Q jh_scraping_enrichment
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=enrichment-%n
+
+  # ── Worker: jh_jobs_maintenance ──────────────────────────────────────────────
+  # Tasks: deduplicate_jobs_task, cleanup_old_jobs_task
+  worker-maintenance:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    cpus: 0.25
+    mem_limit: 256m
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_MAINTENANCE_SCALE:-1}
+    environment:
+      SERVICE_NAME: "worker-maintenance"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_MAINTENANCE_CONCURRENCY:-2}
+      -Q jh_jobs_maintenance
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=maintenance-redis-%n
+
+  # ── Worker: jh_cover_letter_bulk ─────────────────────────────────────────────
+  # Tasks: fill_missing_covers_task, refresh_cover_letters_task
+  worker-cover-bulk:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    cpus: 0.25
+    mem_limit: 256m
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_COVER_BULK_SCALE:-2}
+    environment:
+      SERVICE_NAME: "worker-cover-bulk"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_COVER_BULK_CONCURRENCY:-2}
+      -Q jh_cover_letter_bulk
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=cover-bulk-redis-%n
+
+  # ── Worker: jh_cover_letter_ranking ──────────────────────────────────────────
+  # Tasks: rank_jobs_task
+  worker-cover-ranking:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    cpus: 0.25
+    mem_limit: 256m
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_COVER_RANKING_SCALE:-2}
+    environment:
+      SERVICE_NAME: "worker-cover-ranking"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_COVER_RANKING_CONCURRENCY:-2}
+      -Q jh_cover_letter_ranking
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=ranking-redis-%n
+
+  # ── Worker: jh_cover_letter_generation ──────────────────────────────────────
+  # Tasks: generate_cover_letter_task, generate_embedding_task
+  # Hottest path — scale kept at 1 locally; increase for production throughput.
+  worker-cover-generation:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    cpus: 0.5
+    mem_limit: 512m
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_COVER_GENERATION_SCALE:-3}
+    environment:
+      SERVICE_NAME: "worker-cover-generation"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_COVER_GENERATION_CONCURRENCY:-2}
+      -Q jh_cover_letter_generation,jh_embeddings
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=50
+      --hostname=generation-redis-%n
+
+  # ── Worker: jh_cover_letter_workflow ────────────────────────────────────────
+  # Tasks: run_application_workflow_task  (rank → cover → queue email)
+  worker-cover-workflow:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    cpus: 0.25
+    mem_limit: 256m
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_COVER_WORKFLOW_SCALE:-2}
+    environment:
+      SERVICE_NAME: "worker-cover-workflow"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_COVER_WORKFLOW_CONCURRENCY:-2}
+      -Q jh_cover_letter_workflow
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=workflow-redis-%n
+
+  # ── Worker: jh_email_send + jh_email_retry ────────────────────────────────────
+  # Tasks: send_application_email_task, retry_failed_sends_task
+  worker-email:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    cpus: 0.25
+    mem_limit: 256m
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: ${WORKER_EMAIL_SCALE:-2}
+    environment:
+      SERVICE_NAME: "worker-email"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${WORKER_EMAIL_CONCURRENCY:-2}
+      -Q jh_email_send,jh_email_retry
+      -Ofair
+      -E --without-mingle --without-gossip
+      --max-tasks-per-child=100
+      --hostname=email-redis-%n
+
+  # ── Worker: jh_cover_letter_batch ────────────────────────────────────────────
+  # Tasks: enqueue_cover_letter_task, flush_cover_batch_task
+  # Single concurrency — one flush runs at a time, draining GROQ_RPM items/min.
+  worker-cover-batch:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    cpus: 0.25
+    mem_limit: 256m
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    deploy:
+      replicas: 1   # intentionally single replica — rate limiter is per-key
+    environment:
+      SERVICE_NAME: "worker-cover-batch"
+      OTEL_SDK_DISABLED: "true"
+      LOG_TO_FILE: "false"
+      LANGFUSE_ENABLED: "${LANGFUSE_ENABLED:-false}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LANGFUSE_HOST: "${LANGFUSE_HOST:-https://cloud.langfuse.com}"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A services.scraper.celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=1
+      --prefetch-multiplier=1
+      -Q jh_cover_letter_batch
+      -Ofair
+      -E --without-mingle --without-gossip
+      --hostname=cover-batch-%n
+
+  # ── Beat scheduler ───────────────────────────────────────────────────────────
+  # Beat connects to RabbitMQ (RABBITMQ_URL set in .env) and dispatches tasks
+  # to all queues using unified RabbitMQ architecture
+  beat:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    env_file: ./.env
+    container_name: Scheduler
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    environment:
+      SERVICE_NAME: "beat"
+      LOG_TO_FILE: "false"
+    volumes:
+      - ../backend:/app/backend
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A services.scraper.celery_app beat --loglevel=info
+
+
+  # ── Ollama (local LLM + embeddings) ──────────────────────────────────────────
+  # Provides nomic-embed-text embeddings for job similarity scoring.
+  # Workers reach Ollama at http://ollama:11434 (set OLLAMA_HOST in .env).
+  # First run: docker exec ollama ollama pull nomic-embed-text
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    cpus: 1.5
+    mem_limit: 4g
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.dashboard
+    container_name: Frontend
+    ports:
+      - "3001:3000"
+    env_file: ./.env
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    depends_on:
+      - api
+
+  # ── Docker control agent ──────────────────────────────────────────────────────
+  # Lightweight sidecar with Docker socket access for admin scale/restart commands.
+  # Subscribes to Redis channel admin:docker:commands and executes docker compose.
+  docker-agent:
+    image: python:3.11-slim
+    container_name: docker-agent
+    working_dir: /app
+    env_file: ./.env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker-compose.yml:/app/docker-compose.yml:ro
+      - ./docker_agent.py:/app/docker_agent.py:ro
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "pip install redis[hiredis] -q && python docker_agent.py"
+
+volumes:
+  pg_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  redis_data:
+    driver: local
+  ollama_data:
+    driver: local

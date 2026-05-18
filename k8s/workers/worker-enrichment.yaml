@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-enrichment
+  namespace: job-hunter
+  labels:
+    app: worker-enrichment
+    worker-type: scraping
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-enrichment
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: worker-enrichment
+    spec:
+      terminationGracePeriodSeconds: 1980
+      containers:
+        - name: worker
+          image: k3d-jh-registry:5050/jh-worker-lightweight:local
+          command:
+            - celery
+            - -A
+            - services.scraper.celery_app
+            - worker
+            - --loglevel=warning
+            - --concurrency=6
+            - -Q
+            - jh_scraping_enrichment
+            - -Ofair
+            - -E
+            - --without-mingle
+            - --without-gossip
+            - --max-tasks-per-child=200
+            - --hostname=enrichment-%(n)s@%h
+          env:
+            - name: SERVICE_NAME
+              value: "worker-enrichment"
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          resources:
+            requests:
+              memory: "192Mi"
+              cpu: "75m"
+            limits:
+              memory: "768Mi"
+              cpu: "300m"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-enrichment-scaler
+  namespace: job-hunter
+spec:
+  scaleTargetRef:
+    name: worker-enrichment
+  pollingInterval: 10
+  cooldownPeriod: 20
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_scraping_enrichment
+        mode: QueueLength
+        value: "5"
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq

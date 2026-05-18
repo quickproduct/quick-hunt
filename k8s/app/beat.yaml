@@ -1,0 +1,47 @@
+# Celery beat scheduler — ALWAYS exactly 1 replica.
+# Two beat instances = duplicate scheduled tasks fired.
+# Recreate strategy: kill old pod before starting new (no dual-instance window).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beat
+  namespace: job-hunter
+  labels:
+    app: beat
+    scaling-policy: fixed
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beat
+  strategy:
+    type: Recreate  # No RollingUpdate — prevents two beats running simultaneously
+  template:
+    metadata:
+      labels:
+        app: beat
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: beat
+          image: k3d-jh-registry:5050/jh-worker-lightweight:local
+          command:
+            - celery
+            - -A
+            - services.scraper.celery_app
+            - beat
+            - --loglevel=info
+            - --scheduler=celery.beat:PersistentScheduler
+            - --schedule=/tmp/celerybeat-schedule
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "30m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"

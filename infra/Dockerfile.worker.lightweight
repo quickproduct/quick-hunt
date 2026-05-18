@@ -1,0 +1,25 @@
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements-shared.txt ./backend/requirements-shared.txt
+COPY backend/services/scraper/requirements.txt ./backend/services/scraper/requirements.txt
+
+RUN pip install --no-cache-dir \
+    -r backend/requirements-shared.txt \
+    -r backend/services/scraper/requirements.txt
+
+COPY backend/services/ ./backend/services/
+COPY backend/alembic/ ./backend/alembic/
+COPY backend/alembic.ini ./backend/alembic.ini
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+USER appuser
+
+ENV PYTHONPATH=/app/backend
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+CMD ["celery", "-A", "services.scraper.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "jh_cover_letter_bulk,jh_cover_letter_ranking,jh_cover_letter_generation,jh_cover_letter_workflow,jh_email_send,jh_scraping_enrichment,jh_cover_letter_batch"]

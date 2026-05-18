@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-scraping-bulk
+  namespace: job-hunter
+  labels:
+    app: worker-scraping-bulk
+    worker-type: scraping
+spec:
+  replicas: 1  # KEDA manages this — initial = minReplicaCount
+  selector:
+    matchLabels:
+      app: worker-scraping-bulk
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: worker-scraping-bulk
+    spec:
+      # Must be > task_time_limit (1920s) so in-flight tasks complete before SIGKILL
+      terminationGracePeriodSeconds: 1980
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi  # Playwright browser peaks at ~800MB SHM under load
+      containers:
+        - name: worker
+          image: k3d-jh-registry:5050/jh-worker-playwright:local
+          command:
+            - celery
+            - -A
+            - services.scraper.celery_app
+            - worker
+            - --loglevel=warning
+            - --concurrency=1
+            - -Q
+            - jh_scraping_bulk
+            - -Ofair
+            - -E
+            - --without-mingle
+            - --without-gossip
+            - --max-tasks-per-child=100
+            - --hostname=scraping-bulk-%(n)s@%h
+          env:
+            - name: SERVICE_NAME
+              value: "worker-scraping-bulk"
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "200m"
+            limits:
+              memory: "2Gi"  # Playwright peaks at 1-1.3GB process + 1GB SHM under real scraping
+              cpu: "1000m"
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", "pgrep -f 'celery.*worker' > /dev/null"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-scraping-bulk-scaler
+  namespace: job-hunter
+spec:
+  scaleTargetRef:
+    name: worker-scraping-bulk
+  pollingInterval: 10
+  cooldownPeriod: 45  # Playwright pods are expensive — scale down slowly
+  minReplicaCount: 1
+  maxReplicaCount: 2   # 8GB node; Playwright too heavy to run multiple instances
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_scraping_bulk
+        mode: QueueLength
+        value: "10"  # 1 pod per 10 queued messages
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq

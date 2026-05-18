@@ -1,0 +1,32 @@
+sqlalchemy[asyncio]==2.0.30
+asyncpg==0.29.0
+alembic==1.13.1
+pgvector==0.3.6
+pydantic==2.9.2
+pydantic-settings==2.2.1
+redis==5.0.4
+celery==5.4.0
+flower==2.0.1
+boto3==1.34.100
+structlog==24.1.0
+httpx==0.27.0
+python-dotenv==1.0.1
+# Groq uses OpenAI SDK with custom base_url
+openai==1.30.1
+# LangChain + LangGraph AI workflow
+langchain-core==0.2.43
+langchain-groq==0.1.9
+langgraph==0.2.27
+langchain-community==0.2.16
+# PDF text extraction for resume parsing
+pypdf==4.3.1
+# Razorpay billing
+razorpay==1.4.2
+# JWT auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+# Langfuse — LLM observability (traces, scores, costs)
+langfuse>=4.0.0
+# Prometheus metrics for FastAPI
+prometheus-fastapi-instrumentator==6.1.0
+prometheus-client==0.20.0

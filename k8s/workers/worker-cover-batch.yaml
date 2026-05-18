@@ -1,0 +1,58 @@
+# Rate-limited batch processor — ALWAYS exactly 1 replica, NO KEDA.
+# Two instances would violate the GROQ_RPM rate limit.
+# concurrency=1 + prefetch-multiplier=1 ensure strictly one task at a time.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-cover-batch
+  namespace: job-hunter
+  labels:
+    app: worker-cover-batch
+    worker-type: cover-letter
+    scaling-policy: fixed
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-cover-batch
+  strategy:
+    type: Recreate  # No RollingUpdate — prevents even a brief two-pod window
+  template:
+    metadata:
+      labels:
+        app: worker-cover-batch
+    spec:
+      terminationGracePeriodSeconds: 1980
+      containers:
+        - name: worker
+          image: k3d-jh-registry:5050/jh-worker-lightweight:local
+          command:
+            - celery
+            - -A
+            - services.scraper.celery_app
+            - worker
+            - --loglevel=warning
+            - --concurrency=1
+            - --prefetch-multiplier=1
+            - -Q
+            - jh_cover_letter_batch
+            - -Ofair
+            - -E
+            - --without-mingle
+            - --without-gossip
+            - --hostname=cover-batch-%(n)s@%h
+          env:
+            - name: SERVICE_NAME
+              value: "worker-cover-batch"
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "30m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"

@@ -1,0 +1,90 @@
+# Hottest path — LLM + Ollama embeddings.
+# Two KEDA triggers: KEDA scales to the MAX of both queue lengths.
+# minReplicaCount=1 (local: 8GB RAM shared with playwright scrapers)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-cover-generation
+  namespace: job-hunter
+  labels:
+    app: worker-cover-generation
+    worker-type: cover-letter
+spec:
+  replicas: 1  # Matches minReplicaCount
+  selector:
+    matchLabels:
+      app: worker-cover-generation
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: worker-cover-generation
+    spec:
+      terminationGracePeriodSeconds: 1980
+      containers:
+        - name: worker
+          image: k3d-jh-registry:5050/jh-worker-lightweight:local
+          command:
+            - celery
+            - -A
+            - services.scraper.celery_app
+            - worker
+            - --loglevel=warning
+            - --concurrency=3
+            - -Q
+            - jh_cover_letter_generation,jh_embeddings
+            - -Ofair
+            - -E
+            - --without-mingle
+            - --without-gossip
+            - --max-tasks-per-child=50
+            - --hostname=cover-generation-%(n)s@%h
+          env:
+            - name: SERVICE_NAME
+              value: "worker-cover-generation"
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "384Mi"
+              cpu: "400m"
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-cover-generation-scaler
+  namespace: job-hunter
+spec:
+  scaleTargetRef:
+    name: worker-cover-generation
+  pollingInterval: 5  # Fast polling — hottest path in the system
+  cooldownPeriod: 20
+  minReplicaCount: 1
+  maxReplicaCount: 6
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_cover_letter_generation
+        mode: QueueLength
+        value: "3"  # Aggressive: 1 pod per 3 messages
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_embeddings
+        mode: QueueLength
+        value: "3"
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq

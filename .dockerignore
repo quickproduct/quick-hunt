@@ -1,0 +1,78 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+log/
+
+# Python
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv
+venv/
+ENV/
+env/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Next.js
+.next/
+out/
+.turbo
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+
+# Docker
+docker-compose.override.yml
+docker-compose*.local.yml
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Plans
+plans/
+
+# Infrastructure data
+infra/backups/
+infra/grafana/data/
+infra/prometheus/data/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup

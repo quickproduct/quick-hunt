@@ -1,0 +1,279 @@
+# =============================================================================
+#  AI Job Hunter Bot - Comprehensive Gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENT FILES & SECRETS - NEVER COMMIT
+# -----------------------------------------------------------------------------
+# Infrastructure env files
+infra/.env
+infra/.env.docker
+infra/.env.local
+infra/.env.*.local
+
+# Backend env files
+backend/.env
+backend/.env.local
+backend/.env.*.local
+
+# Frontend env files (but keep .env.example templates)
+frontend/dashboard/.env.local
+frontend/dashboard/.env.development.local
+frontend/dashboard/.env.test.local
+frontend/dashboard/.env.production.local
+
+# Any .env files not ending in .example
+**/.env
+!**/.env.example
+
+# -----------------------------------------------------------------------------
+# DATABASE BACKUPS & DUMPS
+# -----------------------------------------------------------------------------
+# infra/backups/*.sql
+# backend/backupDb/*.sql
+# infra/backups/*.dump
+# infra/backups/*.backup
+# infra/backups/*.gz
+# infra/backups/*.zip
+# *.sqlite
+# *.sqlite3
+# *.db
+
+# -----------------------------------------------------------------------------
+# PYTHON - Backend
+# -----------------------------------------------------------------------------
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Python testing & coverage
+tests/.pytest_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# -----------------------------------------------------------------------------
+# JAVASCRIPT / TYPESCRIPT - Frontend
+# -----------------------------------------------------------------------------
+# Dependencies
+frontend/dashboard/node_modules/
+**/node_modules/
+
+# Next.js build output
+frontend/dashboard/.next/
+frontend/dashboard/out/
+frontend/dashboard/dist/
+.next/
+out/
+dist/
+
+# Production build
+build/
+
+# Vercel deployment
+.vercel
+
+# Turbo
+.turbo
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Package manager logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# -----------------------------------------------------------------------------
+# LOGS
+# -----------------------------------------------------------------------------
+*.log
+*.log.*
+backend/logs/
+backend/logs/*.log
+frontend/dashboard/logs/
+
+# Allow mobile app logs directory (for LogsScreen component)
+!mobile/src/screens/logs/
+
+# -----------------------------------------------------------------------------
+# PLAYWRIGHT - Scraping Browser Cache
+# -----------------------------------------------------------------------------
+playwright/.cache/
+**/playwright-report/
+**/test-results/
+**/.playwright/
+
+# -----------------------------------------------------------------------------
+# DOCKER
+# -----------------------------------------------------------------------------
+*.dockerfile~*
+docker-compose.override.yml
+docker-compose*.local.yml
+
+# -----------------------------------------------------------------------------
+# IDE & EDITOR FILES
+# -----------------------------------------------------------------------------
+# VSCode
+.vscode/
+*.code-workspace
+.history/
+
+# JetBrains (PyCharm, WebStorm, IntelliJ)
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim/Neovim
+*.swp
+*.swo
+*~
+.vim/
+
+# Emacs
+*~
+#*#
+.#*
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+Thumbs.db
+
+# -----------------------------------------------------------------------------
+# TEMPORARY FILES
+# -----------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*.rej
+*.diff
+*.patch
+*.pid
+*.seed
+*.pid.lock
+
+# -----------------------------------------------------------------------------
+# CERTIFICATES & KEYS
+# -----------------------------------------------------------------------------
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+id_dsa
+id_dsa.pub
+id_ecdsa
+id_ecdsa.pub
+id_ed25519
+id_ed25519.pub
+known_hosts
+.ssh/
+
+# -----------------------------------------------------------------------------
+# INFRASTRUCTURE & MONITORING
+# -----------------------------------------------------------------------------
+# Grafana data (if persisted locally)
+infra/grafana/data/
+
+# Prometheus data
+infra/prometheus/data/
+
+# MinIO local data (if any)
+minio_data/
+.s3cfg
+
+# Redis dump
+*.rdb
+*.aof
+
+# -----------------------------------------------------------------------------
+# ALEMBIC (keep migrations, ignore local configs)
+# -----------------------------------------------------------------------------
+backend/alembic.ini.bak
+
+# -----------------------------------------------------------------------------
+# LOCAL SCRIPTS & NOTES
+# -----------------------------------------------------------------------------
+local/
+*.local.sh
+*.local.py
+notes.txt
+todo.txt
+
+# -----------------------------------------------------------------------------
+# RESUME UPLOADS (if stored locally during dev)
+# -----------------------------------------------------------------------------
+uploads/resumes/*.pdf
+uploads/resumes/*.doc
+uploads/resumes/*.docx
+!uploads/resumes/.gitkeep
+
+# -----------------------------------------------------------------------------
+# MOBILE - EXPO CACHE
+# -----------------------------------------------------------------------------
+mobile/.expo/
+
+# -----------------------------------------------------------------------------
+# AI CODING ASSISTANTS
+# -----------------------------------------------------------------------------
+.opencode/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude

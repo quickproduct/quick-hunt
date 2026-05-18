@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: job-hunter-config
+  namespace: job-hunter
+data:
+  # --- Environment ---
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "WARNING"
+  LOG_TO_FILE: "false"
+  OTEL_SDK_DISABLED: "true"
+
+  # --- Database ---
+  POSTGRES_DB: "jobhunter"
+  POSTGRES_USER: "jobhunter"
+  POSTGRES_LOCAL: "true"
+
+  # --- RabbitMQ ---
+  RABBITMQ_DEFAULT_USER: "jobhunter"
+
+  # --- Celery / Worker ---
+  # broker_pool_limit raised to 10 — no longer constrained by CloudAMQP free tier
+  BROKER_POOL_LIMIT: "10"
+  WORKER_PREFETCH_MULTIPLIER: "1"
+  TASK_SOFT_TIME_LIMIT: "1800"
+  TASK_TIME_LIMIT: "1920"
+  TASK_ACKS_LATE: "true"
+  TASK_REJECT_ON_WORKER_LOST: "true"
+
+  # --- LLM ---
+  LLM_PROVIDER: "groq"
+  GROQ_MODEL: "llama-3.3-70b-versatile"
+  GROQ_RPM: "10"
+  GROQ_TPM: "12000"
+
+  # --- Embeddings ---
+  OLLAMA_HOST: "http://ollama:11434"
+  OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
+  VECTOR_DB_PROVIDER: "local"
+
+  # --- Storage ---
+  S3_ENDPOINT_URL: "CHANGE_ME_TO_YOUR_R2_ENDPOINT"
+  S3_BUCKET_NAME: "jobhunter-resumes"
+  S3_REGION: "auto"
+
+  # --- Email ---
+  EMAIL_PROVIDER: "brevo"
+  BREVO_FROM_EMAIL: "CHANGE_ME"
+  BREVO_FROM_NAME: "Job Hunter"
+  AUTO_SEND_ENABLED: "false"
+
+  # --- Scraping ---
+  RESPECT_ROBOTS_TXT: "true"
+  DEFAULT_CRAWL_DELAY_SECONDS: "2"
+
+  # --- Observability ---
+  LANGFUSE_ENABLED: "false"
+  LANGFUSE_HOST: "https://cloud.langfuse.com"
+  LANGCHAIN_ENABLED: "true"
+
+  # --- Frontend ---
+  FRONTEND_URL: "CHANGE_ME_TO_YOUR_DOMAIN"
+
+  # --- Beat schedule intervals (seconds) ---
+  BEAT_SCRAPE_INTERVAL: "7200"
+  BEAT_REFRESH_COVERS_INTERVAL: "14400"
+  BEAT_FILL_COVERS_INTERVAL: "300"
+  BEAT_RETRY_SENDS_INTERVAL: "1800"
+  BEAT_CLEANUP_INTERVAL: "604800"
