@@ -5,6 +5,30 @@ import { Search, Plus, X, Loader2, CheckCircle, AlertCircle } from 'lucide-react
 import toast from 'react-hot-toast';
 import { triggerSearch, getSearchTask, getCandidates, type Candidate } from '../../lib/api';
 
+const ROLE_PRESETS: Record<string, string[]> = {
+  php: [
+    'PHP Senior Backend Engineer',
+    'PHP Backend Engineer',
+    'Laravel Developer',
+    'PHP Software Engineer (Backend)',
+    'PHP Developer',
+    'PHP Full Stack Engineer',
+    'PHP Laravel Developer',
+  ],
+  python: [
+    'Python Senior Backend Engineer',
+    'Python Backend Engineer',
+    'Django Developer',
+    'Python Software Engineer (Backend)',
+    'Python Developer',
+    'FastAPI Developer',
+    'Generative AI Engineer',
+    'AI Engineer',
+    'LLM Engineer',
+    'Python AI/ML Backend Engineer',
+  ],
+};
+
 const PORTALS: { name: string; label?: string; group: string }[] = [
   // Indian portals
   { name: 'naukri',      group: 'India' },
@@ -22,18 +46,11 @@ export default function SearchPage() {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [form, setForm] = useState({
     candidateId: '',
-    jobTitles: [
-      'PHP Senior Backend Engineer',
-      'PHP Backend Engineer',
-      'Laravel Developer',
-      'PHP Software Engineer (Backend)',
-      'PHP Developer',
-      'PHP Full Stack Engineer',
-      'PHP Laravel Developer',
-    ],
+    jobPosition: 'php',
+    jobTitles: ROLE_PRESETS.php,
     locations: ['India', 'Bangalore', 'Remote', 'Mumbai', 'Hyderabad', 'Pune', 'Chennai', 'Delhi', 'Gurgaon', 'Noida'],
-    portals: ['naukri', 'indeed'],
-    maxResults: 50,
+    portals: PORTALS.map(p => p.name),
+    maxResults: 200,
     autoCovers: true,
   });
   const [submitting, setSubmitting] = useState(false);
@@ -156,6 +173,19 @@ export default function SearchPage() {
             className="w-full text-sm rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2"
           >
             {candidates.map(c => <option key={c.id} value={c.id}>{c.name} ({c.email})</option>)}
+          </select>
+        </div>
+
+        {/* Job Position */}
+        <div>
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Job Position</label>
+          <select
+            value={form.jobPosition}
+            onChange={e => setForm(f => ({ ...f, jobPosition: e.target.value, jobTitles: ROLE_PRESETS[e.target.value] }))}
+            className="w-full text-sm rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2"
+          >
+            <option value="php">PHP Role</option>
+            <option value="python">Python Role</option>
           </select>
         </div>
 

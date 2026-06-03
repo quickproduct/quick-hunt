@@ -192,9 +192,9 @@ def send_application_email_task(
 
             subject = override_subject or f"Application for {job.job_title} at {job.company}"
 
-            # Non-PHP jobs (Java, Node.js, etc.): use candidate's static_cover_letter
-            # directly — same as Direct HR Send, always fresh, no PHP/Laravel mentions.
-            if not job.is_php_python and candidate.static_cover_letter:
+            # MNC jobs always use static_cover_letter regardless of PHP/Python flag.
+            # Non-PHP jobs also use static_cover_letter — no PHP/Laravel mentions.
+            if (job.source_portal == "mnc_direct" or not job.is_php_python) and candidate.static_cover_letter:
                 cover_letter = candidate.static_cover_letter
             elif job.cover_letter:
                 cover_letter = job.cover_letter
@@ -263,6 +263,13 @@ def send_application_email_task(
             send_log.provider_message_id = message_id
             send_log.sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
             job.status = "sent"
+            from services.api.models.hr_email_utils import upsert_hr_email
+            await upsert_hr_email(
+                session=session,
+                tenant_id=job.tenant_id,
+                email=to_email,
+                increment_send_count=True,
+            )
             await session.commit()
 
         logger.info("send_task_complete", job_id=job_id, message_id=message_id)

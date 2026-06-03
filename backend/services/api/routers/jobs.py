@@ -59,6 +59,8 @@ def _apply_job_filters(
     has_active_send: Optional[bool] = None,
     scraped_after: Optional[str] = None,
     posted_after: Optional[str] = None,
+    mnc_only: Optional[bool] = None,
+    consulting_only: Optional[bool] = None,
 ):
     """Apply all common where-clause filters to a job query."""
     if status:
@@ -122,6 +124,28 @@ def _apply_job_filters(
             )
         )
 
+    # mnc_only and consulting_only are mutually exclusive *positively* — a job
+    # can't be both. Reject the impossible combination so callers learn instead
+    # of silently getting an empty result set.
+    if mnc_only is True and consulting_only is True:
+        # Note: can't use `status.HTTP_422_*` here — the function parameter
+        # `status` shadows the fastapi status module in this scope.
+        raise HTTPException(
+            status_code=422,
+            detail="mnc_only=true and consulting_only=true cannot both be set "
+                   "(a job has exactly one source_portal). Pick one.",
+        )
+
+    if mnc_only is True:
+        q = q.where(Job.source_portal == "mnc_direct")
+    elif mnc_only is False:
+        q = q.where(Job.source_portal != "mnc_direct")
+
+    if consulting_only is True:
+        q = q.where(Job.source_portal == "consulting_direct")
+    elif consulting_only is False:
+        q = q.where(Job.source_portal != "consulting_direct")
+
     # Always exclude blacklisted companies — mirrors is_company_blacklisted() logic:
     # bidirectional case-insensitive substring match, with and without spaces.
     job_co_lower = func.lower(Job.company)
@@ -161,6 +185,8 @@ async def list_jobs(
     has_active_send: Optional[bool] = Query(None, description="Exclude jobs with active send attempts"),
     scraped_after: Optional[str] = Query(None, description="ISO date string, e.g. 2026-04-10"),
     posted_after: Optional[str] = Query(None, description="ISO date string, e.g. 2026-04-10"),
+    mnc_only: Optional[bool] = Query(None, description="true=MNC jobs only, false=exclude MNC jobs"),
+    consulting_only: Optional[bool] = Query(None, description="true=Consulting jobs only, false=exclude Consulting jobs"),
     # sorting
     sort_by: str = Query(default="scraped_at", pattern="^(scraped_at|relevance_score|company|job_title)$"),
     sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
@@ -172,7 +198,9 @@ async def list_jobs(
         status=status, portal=portal, company=company, has_hr_email=has_hr_email,
         min_score=min_score, search=search, max_score=max_score, has_cover=has_cover,
         job_type=job_type, has_active_send=has_active_send, scraped_after=scraped_after,
-        posted_after=posted_after, sort_by=sort_by, sort_dir=sort_dir, page=page, page_size=page_size,
+        posted_after=posted_after, mnc_only=mnc_only, consulting_only=consulting_only,
+        sort_by=sort_by, sort_dir=sort_dir,
+        page=page, page_size=page_size,
     )
     cached = await cache_get(cache_key)
     if cached is not None:
@@ -193,6 +221,8 @@ async def list_jobs(
         has_active_send=has_active_send,
         scraped_after=scraped_after,
         posted_after=posted_after,
+        mnc_only=mnc_only,
+        consulting_only=consulting_only,
     )
     sort_col = {
         "scraped_at": Job.scraped_at,
@@ -226,12 +256,14 @@ async def count_jobs(
     has_active_send: Optional[bool] = Query(None, description="Exclude jobs with active send attempts"),
     scraped_after: Optional[str] = Query(None),
     posted_after: Optional[str] = Query(None),
+    mnc_only: Optional[bool] = Query(None),
+    consulting_only: Optional[bool] = Query(None),
 ) -> dict:
     cache_key = _count_cache_key(
         status=status, portal=portal, company=company, has_hr_email=has_hr_email,
         min_score=min_score, search=search, max_score=max_score, has_cover=has_cover,
         job_type=job_type, has_active_send=has_active_send, scraped_after=scraped_after,
-        posted_after=posted_after,
+        posted_after=posted_after, mnc_only=mnc_only, consulting_only=consulting_only,
     )
     cached = await cache_get(cache_key)
     if cached is not None:
@@ -252,6 +284,8 @@ async def count_jobs(
         has_active_send=has_active_send,
         scraped_after=scraped_after,
         posted_after=posted_after,
+        mnc_only=mnc_only,
+        consulting_only=consulting_only,
     )
     result = await db.execute(q)
     data = {"count": result.scalar_one()}
@@ -277,6 +311,8 @@ async def list_job_ids(
     has_active_send: Optional[bool] = Query(None),
     scraped_after: Optional[str] = Query(None),
     posted_after: Optional[str] = Query(None),
+    mnc_only: Optional[bool] = Query(None),
+    consulting_only: Optional[bool] = Query(None),
 ) -> list[str]:
     """Return all matching job IDs for the given filters (no pagination cap).
 
@@ -299,10 +335,178 @@ async def list_job_ids(
         has_active_send=has_active_send,
         scraped_after=scraped_after,
         posted_after=posted_after,
+        mnc_only=mnc_only,
+        consulting_only=consulting_only,
     )
     q = q.limit(5000)
     result = await db.execute(q)
     return [str(row[0]) for row in result.all()]
+
+
+@router.post("/trigger-mnc-scrape", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_mnc_scrape(
+    current_user: Auth,
+    candidate_id: Optional[str] = None,
+):
+    """Enqueue an MNC scrape dispatcher task.
+
+    The dispatcher acquires a per-tenant Redis lock; if a scrape is already
+    in flight the response carries `status: "already_running"` and HTTP 409.
+    """
+    from services.api.core.cache import get_redis
+    from services.scraper.celery_app import celery_app as _celery
+
+    tid = current_user.tenant_id
+    lock_key = f"mnc:scrape:lock:{tid}"
+
+    # Cheap pre-check so the UI gets immediate feedback; the worker still
+    # re-acquires atomically (NX EX) — that's the real source of truth.
+    try:
+        r = await get_redis()
+        if r is not None and await r.exists(lock_key):
+            raise HTTPException(
+                status_code=409,
+                detail={"status": "already_running", "tenant_id": tid},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Redis-down: fall through and let the worker decide.
+
+    task = _celery.send_task(
+        "services.scraper.tasks.mnc_scrape_dispatch_task",
+        kwargs={"candidate_id": candidate_id, "tenant_id": tid},
+        queue="jh_scraping_mnc_dispatch",
+    )
+    return {
+        "task_id": task.id,
+        "dispatch_id": task.id,
+        "status": "queued",
+        "portal": "mnc_direct",
+    }
+
+
+@router.get("/mnc-scrape-status")
+async def get_mnc_scrape_status(current_user: Auth):
+    """Return current MNC scrape progress for the caller's tenant.
+
+    Reads the per-tenant Redis hash populated by `mnc_scrape_dispatch_task`
+    and incremented by each `mnc_scrape_company_task`.
+    """
+    from services.api.core.cache import get_redis
+
+    tid = current_user.tenant_id
+    lock_key = f"mnc:scrape:lock:{tid}"
+    progress_key = f"mnc:scrape:progress:{tid}"
+
+    r = await get_redis()
+    if r is None:
+        return {"in_flight": False, "progress": None}
+
+    try:
+        in_flight = bool(await r.exists(lock_key))
+        raw = await r.hgetall(progress_key) or {}
+    except Exception:
+        return {"in_flight": False, "progress": None}
+
+    def _int(v, default=0):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    progress = {
+        "dispatch_id": raw.get("dispatch_id"),
+        "candidate_id": raw.get("candidate_id") or None,
+        "total": _int(raw.get("total")),
+        "done": _int(raw.get("done")),
+        "saved": _int(raw.get("saved")),
+        "started_at": raw.get("started_at"),
+        "finished_at": raw.get("finished_at"),
+        "final_saved": _int(raw.get("final_saved")) if raw.get("final_saved") else None,
+        "final_errors": _int(raw.get("final_errors")) if raw.get("final_errors") else 0,
+        "final_timeouts": _int(raw.get("final_timeouts")) if raw.get("final_timeouts") else 0,
+    } if raw else None
+
+    return {"in_flight": in_flight, "progress": progress}
+
+
+@router.post("/trigger-consulting-scrape", status_code=status.HTTP_202_ACCEPTED)
+async def trigger_consulting_scrape(
+    current_user: Auth,
+    candidate_id: Optional[str] = None,
+):
+    """Enqueue a consulting/outsourcing scrape dispatcher task."""
+    from services.api.core.cache import get_redis
+    from services.scraper.celery_app import celery_app as _celery
+
+    tid = current_user.tenant_id
+    lock_key = f"consulting:scrape:lock:{tid}"
+
+    try:
+        r = await get_redis()
+        if r is not None and await r.exists(lock_key):
+            raise HTTPException(
+                status_code=409,
+                detail={"status": "already_running", "tenant_id": tid},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    task = _celery.send_task(
+        "services.scraper.tasks.consulting_scrape_dispatch_task",
+        kwargs={"candidate_id": candidate_id, "tenant_id": tid},
+        queue="jh_scraping_consulting_dispatch",
+    )
+    return {
+        "task_id": task.id,
+        "dispatch_id": task.id,
+        "status": "queued",
+        "portal": "consulting_direct",
+    }
+
+
+@router.get("/consulting-scrape-status")
+async def get_consulting_scrape_status(current_user: Auth):
+    """Return current consulting scrape progress for the caller's tenant."""
+    from services.api.core.cache import get_redis
+
+    tid = current_user.tenant_id
+    lock_key = f"consulting:scrape:lock:{tid}"
+    progress_key = f"consulting:scrape:progress:{tid}"
+
+    r = await get_redis()
+    if r is None:
+        return {"in_flight": False, "progress": None}
+
+    try:
+        in_flight = bool(await r.exists(lock_key))
+        raw = await r.hgetall(progress_key) or {}
+    except Exception:
+        return {"in_flight": False, "progress": None}
+
+    def _int(v, default=0):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    progress = {
+        "dispatch_id": raw.get("dispatch_id"),
+        "candidate_id": raw.get("candidate_id") or None,
+        "total": _int(raw.get("total")),
+        "done": _int(raw.get("done")),
+        "saved": _int(raw.get("saved")),
+        "started_at": raw.get("started_at"),
+        "finished_at": raw.get("finished_at"),
+        "final_saved": _int(raw.get("final_saved")) if raw.get("final_saved") else None,
+        "final_errors": _int(raw.get("final_errors")) if raw.get("final_errors") else 0,
+        "final_timeouts": _int(raw.get("final_timeouts")) if raw.get("final_timeouts") else 0,
+    } if raw else None
+
+    return {"in_flight": in_flight, "progress": progress}
 
 
 @router.post("/bulk_generate_cover")
@@ -446,6 +650,13 @@ async def set_job_hr_email(
         job.hr_email_discovery_status = "found"
         job.hr_email_discovered_at = datetime.now(timezone.utc).replace(tzinfo=None)
         job.hr_email_discovery_attempts = 0
+        from services.api.models.hr_email_utils import upsert_hr_email
+        await upsert_hr_email(
+            session=db,
+            tenant_id=job.tenant_id,
+            email=job.hr_email,
+            increment_job_count=True,
+        )
     else:
         # Clearing the email — reset to pending so backfill retries
         job.hr_email_discovery_status = "pending"

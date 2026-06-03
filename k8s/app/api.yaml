@@ -23,6 +23,7 @@ spec:
       containers:
         - name: api
           image: k3d-jh-registry:5050/jh-api:local
+          imagePullPolicy: Always
           ports:
             - containerPort: 8000
           envFrom:
@@ -35,7 +36,7 @@ spec:
               memory: "256Mi"
               cpu: "100m"
             limits:
-              memory: "512Mi"
+              memory: "1Gi"
               cpu: "500m"
           livenessProbe:
             httpGet:

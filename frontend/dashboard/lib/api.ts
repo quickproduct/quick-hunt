@@ -530,3 +530,271 @@ export const updateBlacklistEntry = (id: string, data: { reason?: string | null 
 
 export const removeFromBlacklist = (id: string) =>
   apiClient.delete(`/blacklist/${id}`);
+
+// ── MNC Jobs ──────────────────────────────────────────────────────────────────
+
+export const getMncJobs = (params?: Record<string, unknown>) =>
+  getJobs({ ...params, mnc_only: true });
+
+export const getMncJobsCount = (params?: Record<string, unknown>) =>
+  getJobsCount({ ...params, mnc_only: true });
+
+export const getMncJobIds = (params?: Record<string, unknown>) =>
+  getJobIds({ ...params, mnc_only: true });
+
+export const triggerMncScrape = (candidateId?: string) =>
+  apiClient
+    .post<{ task_id: string; dispatch_id: string; status: string; portal: string }>(
+      '/jobs/trigger-mnc-scrape',
+      null,
+      { params: candidateId ? { candidate_id: candidateId } : undefined },
+    )
+    .then((r) => r.data);
+
+export interface MncScrapeProgress {
+  dispatch_id: string | null;
+  candidate_id: string | null;
+  total: number;
+  done: number;
+  saved: number;
+  started_at?: string | null;
+  finished_at?: string | null;
+  final_saved?: number | null;
+  final_errors?: number;
+  final_timeouts?: number;
+}
+
+export interface MncScrapeStatus {
+  in_flight: boolean;
+  progress: MncScrapeProgress | null;
+}
+
+export const getMncScrapeStatus = () =>
+  apiClient.get<MncScrapeStatus>('/jobs/mnc-scrape-status').then((r) => r.data);
+
+// ── MNC Company List (user-managed scraping roster) ──────────────────────────
+
+export type MncAts =
+  | 'greenhouse' | 'lever' | 'smartrecruiters' | 'workday'
+  | 'icims' | 'taleo' | 'bamboohr' | 'custom';
+
+export interface MncCompany {
+  id: string;
+  name: string;
+  career_url: string;
+  ats: MncAts;
+  ats_slug: string | null;
+  active: boolean;
+  is_global: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MncCompanyCreate {
+  name: string;
+  career_url: string;
+  ats: MncAts;
+  ats_slug?: string | null;
+  active?: boolean;
+}
+
+export interface MncCompanyUpdate {
+  name?: string;
+  career_url?: string;
+  ats?: MncAts;
+  ats_slug?: string | null;
+  active?: boolean;
+}
+
+export const getMncCompanies = () =>
+  apiClient.get<MncCompany[]>('/mnc-companies').then((r) => r.data);
+
+export const addMncCompany = (data: MncCompanyCreate) =>
+  apiClient.post<MncCompany>('/mnc-companies', data).then((r) => r.data);
+
+export const updateMncCompany = (id: string, data: MncCompanyUpdate) =>
+  apiClient.put<MncCompany>(`/mnc-companies/${id}`, data).then((r) => r.data);
+
+export const removeMncCompany = (id: string) =>
+  apiClient.delete(`/mnc-companies/${id}`);
+
+// Shadow-disable a global default (creates / flips a tenant row with active=false).
+export const disableMncCompany = (id: string) =>
+  apiClient.post<MncCompany>(`/mnc-companies/${id}/disable`).then((r) => r.data);
+
+// ── Consulting / IT Outsourcing Jobs ─────────────────────────────────────────
+
+export const getConsultingJobs = (params?: Record<string, unknown>) =>
+  getJobs({ ...params, consulting_only: true });
+
+export const getConsultingJobsCount = (params?: Record<string, unknown>) =>
+  getJobsCount({ ...params, consulting_only: true });
+
+export const getConsultingJobIds = (params?: Record<string, unknown>) =>
+  getJobIds({ ...params, consulting_only: true });
+
+export const triggerConsultingScrape = (candidateId?: string) =>
+  apiClient
+    .post<{ task_id: string; dispatch_id: string; status: string; portal: string }>(
+      '/jobs/trigger-consulting-scrape',
+      null,
+      { params: candidateId ? { candidate_id: candidateId } : undefined },
+    )
+    .then((r) => r.data);
+
+export interface ConsultingScrapeProgress {
+  dispatch_id: string | null;
+  candidate_id: string | null;
+  total: number;
+  done: number;
+  saved: number;
+  started_at?: string | null;
+  finished_at?: string | null;
+  final_saved?: number | null;
+  final_errors?: number;
+  final_timeouts?: number;
+}
+
+export interface ConsultingScrapeStatus {
+  in_flight: boolean;
+  progress: ConsultingScrapeProgress | null;
+}
+
+export const getConsultingScrapeStatus = () =>
+  apiClient.get<ConsultingScrapeStatus>('/jobs/consulting-scrape-status').then((r) => r.data);
+
+// ── Consulting Company List (user-managed scraping roster) ───────────────────
+
+export type ConsultingAts = MncAts;
+
+export interface ConsultingCompany {
+  id: string;
+  name: string;
+  career_url: string;
+  ats: ConsultingAts;
+  ats_slug: string | null;
+  active: boolean;
+  is_global: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConsultingCompanyCreate {
+  name: string;
+  career_url: string;
+  ats: ConsultingAts;
+  ats_slug?: string | null;
+  active?: boolean;
+}
+
+export interface ConsultingCompanyUpdate {
+  name?: string;
+  career_url?: string;
+  ats?: ConsultingAts;
+  ats_slug?: string | null;
+  active?: boolean;
+}
+
+export const getConsultingCompanies = () =>
+  apiClient.get<ConsultingCompany[]>('/consulting-companies').then((r) => r.data);
+
+export const addConsultingCompany = (data: ConsultingCompanyCreate) =>
+  apiClient.post<ConsultingCompany>('/consulting-companies', data).then((r) => r.data);
+
+export const updateConsultingCompany = (id: string, data: ConsultingCompanyUpdate) =>
+  apiClient.put<ConsultingCompany>(`/consulting-companies/${id}`, data).then((r) => r.data);
+
+export const removeConsultingCompany = (id: string) =>
+  apiClient.delete(`/consulting-companies/${id}`);
+
+export const disableConsultingCompany = (id: string) =>
+  apiClient.post<ConsultingCompany>(`/consulting-companies/${id}/disable`).then((r) => r.data);
+
+// ── HR Emails ─────────────────────────────────────────────────────────────────
+
+export interface HrEmail {
+  id: string;
+  tenant_id: string;
+  email: string;
+  domain: string;
+  job_count: number;
+  send_count: number;
+  delivered_count: number;
+  opened_count: number;
+  clicked_count: number;
+  hard_bounce_count: number;
+  soft_bounce_count: number;
+  blocked_count: number;
+  spam_count: number;
+  last_send_at?: string;
+  last_bounce_at?: string;
+  last_bounce_type?: string;
+  last_bounce_reason?: string;
+  mx_valid?: boolean;
+  mx_checked_at?: string;
+  validation_status: 'unknown' | 'valid' | 'invalid' | 'bounced' | 'fake';
+  is_placeholder: boolean;
+  first_seen_at?: string;
+  last_seen_at?: string;
+}
+
+export interface HrEmailStats {
+  total_unique: number;
+  valid_count: number;
+  valid_pct: number;
+  bounced_count: number;
+  bounce_rate: number;
+  fake_count: number;
+  unknown_count: number;
+  domains_with_bounces: number;
+  total_sends: number;
+  total_delivered: number;
+}
+
+export interface DomainAnalysisRow {
+  domain: string;
+  email_count: number;
+  send_count: number;
+  bounce_count: number;
+  bounce_rate: number;
+  mx_valid: boolean | null;
+}
+
+export const getHrEmails = (params?: Record<string, unknown>): Promise<HrEmail[]> =>
+  apiClient.get<HrEmail[]>('/hr-emails', { params }).then((r) => r.data);
+
+export const getHrEmailStats = (): Promise<HrEmailStats> =>
+  apiClient.get<HrEmailStats>('/hr-emails/stats').then((r) => r.data);
+
+export const getHrEmailDomainAnalysis = (params?: Record<string, unknown>): Promise<DomainAnalysisRow[]> =>
+  apiClient.get<DomainAnalysisRow[]>('/hr-emails/domain-analysis', { params }).then((r) => r.data);
+
+export const triggerHrEmailBackfill = (): Promise<{ task_id: string; status: string }> =>
+  apiClient.post('/hr-emails/backfill').then((r) => r.data);
+
+export const validateHrEmailMx = (emailId: string): Promise<{ task_id: string; domain: string }> =>
+  apiClient.post(`/hr-emails/${emailId}/validate`).then((r) => r.data);
+
+export const updateHrEmail = (emailId: string, data: { validation_status?: string }): Promise<HrEmail> =>
+  apiClient.patch<HrEmail>(`/hr-emails/${emailId}`, data).then((r) => r.data);
+
+export interface BrevoImportResult {
+  total_rows: number;
+  unique_messages: number;
+  unique_emails: number;
+  send_logs_updated: number;
+  jobs_updated: number;
+  hr_emails_upserted: number;
+  unmatched_messages: number;
+}
+
+export const importBrevoCSV = (file: File): Promise<BrevoImportResult> => {
+  const form = new FormData();
+  form.append('file', file);
+  return apiClient
+    .post<BrevoImportResult>('/hr-emails/import-brevo-csv', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120_000,
+    })
+    .then((r) => r.data);
+};

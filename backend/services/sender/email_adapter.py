@@ -144,22 +144,34 @@ class SMTPAdapter(BaseEmailAdapter):
         from_email = payload.from_email or self._from_email
         from_name = payload.from_name or self._from_name
 
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = payload.subject
-        msg["From"] = f"{from_name} <{from_email}>"
-        msg["To"] = payload.to_email
-        if payload.reply_to:
-            msg["Reply-To"] = payload.reply_to
-
-        msg.attach(MIMEText(payload.plain_body, "plain"))
-        msg.attach(MIMEText(payload.html_body, "html"))
-
         if payload.attachment_bytes:
+            # RFC 2046: outer must be "mixed" when attachments are present.
+            # Text alternatives go inside a nested "alternative" sub-part.
+            msg = MIMEMultipart("mixed")
+            msg["Subject"] = payload.subject
+            msg["From"] = f"{from_name} <{from_email}>"
+            msg["To"] = payload.to_email
+            if payload.reply_to:
+                msg["Reply-To"] = payload.reply_to
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(payload.plain_body, "plain"))
+            alt.attach(MIMEText(payload.html_body, "html"))
+            msg.attach(alt)
             part = MIMEBase("application", "octet-stream")
             part.set_payload(payload.attachment_bytes)
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", f'attachment; filename="{payload.attachment_filename}"')
             msg.attach(part)
+        else:
+            # No attachment — "alternative" is correct.
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = payload.subject
+            msg["From"] = f"{from_name} <{from_email}>"
+            msg["To"] = payload.to_email
+            if payload.reply_to:
+                msg["Reply-To"] = payload.reply_to
+            msg.attach(MIMEText(payload.plain_body, "plain"))
+            msg.attach(MIMEText(payload.html_body, "html"))
 
         if self._use_tls:
             server = smtplib.SMTP(self._host, self._port)

@@ -4,9 +4,9 @@ All date-format parsing logic lives here so every adapter and task can
 share one canonical implementation instead of duplicating regexes.
 
 Core rule: only accept jobs posted within the last *max_job_age_days*
-days (default 60, i.e. current month + previous month).  Jobs whose
-posted_date cannot be determined are **passed through** by default
-(strict=False); set strict=True to reject them.
+days (default 30 — "latest jobs only"; hard cap 90 for admin overrides).
+Jobs whose posted_date cannot be determined are rejected by default
+(strict=True) since undated listings are usually stale.
 """
 
 import re
@@ -18,7 +18,8 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-_DEFAULT_MAX_AGE_DAYS = 60
+_DEFAULT_MAX_AGE_DAYS = 30
+MAX_AGE_DAYS_HARD_CAP = 90
 
 
 @dataclass
@@ -28,6 +29,7 @@ class ScrapeDateStats:
     old_skipped: int = 0
     date_unavailable: int = 0
     parse_failures: int = 0
+    role_filtered: int = 0
     portal: str = ""
 
     def to_dict(self) -> dict:
@@ -38,6 +40,7 @@ class ScrapeDateStats:
             "old_skipped": self.old_skipped,
             "date_unavailable": self.date_unavailable,
             "parse_failures": self.parse_failures,
+            "role_filtered": self.role_filtered,
         }
 
 

@@ -13,8 +13,8 @@ metadata:
   namespace: job-hunter
 spec:
   hard:
-    requests.memory: "4Gi"
-    limits.memory: "10Gi"
-    requests.cpu: "2000m"
-    limits.cpu: "12000m"
-    pods: "60"
+    requests.memory: "16Gi"
+    limits.memory: "40Gi"
+    requests.cpu: "6000m"
+    limits.cpu: "24000m"
+    pods: "80"

@@ -25,6 +25,7 @@ spec:
       containers:
         - name: beat
           image: k3d-jh-registry:5050/jh-worker-lightweight:local
+          imagePullPolicy: Always
           command:
             - celery
             - -A
@@ -40,8 +41,8 @@ spec:
                 name: job-hunter-secrets
           resources:
             requests:
-              memory: "64Mi"
+              memory: "128Mi"
               cpu: "30m"
             limits:
-              memory: "128Mi"
+              memory: "512Mi"
               cpu: "100m"

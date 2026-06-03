@@ -61,8 +61,35 @@ def register(mcp: FastMCP) -> None:
     @track_duration
     async def get_performance_mode() -> str:
         """
-        Show the active worker performance preset: turbo (max throughput),
-        normal (balanced), or economy (low resource usage).
+        Show the active worker performance preset and a side-by-side comparison
+        of all three modes (economy / normal / turbo).
+
+        Response fields:
+          mode            — active preset name ('economy', 'normal', 'turbo', or 'custom')
+          workers         — per-worker settings for the active mode:
+                             scale            = max pods KEDA is allowed to create
+                             concurrency      = Celery worker threads per pod
+                             max_consumers    = scale × concurrency  (total simultaneous tasks)
+          mode_comparison — same stats for every preset so you can compare at a glance:
+                             economy  — 1 pod / 1 thread per worker (minimum footprint)
+                             normal   — same as economy (identical defaults)
+                             turbo    — max pods + threads; scraping_realtime alone
+                                        goes to 10 pods × 8 threads = 80 consumers
+
+        Key differences (max_consumers per worker):
+          Worker               economy  normal  turbo
+          scraping_realtime      4        4      80
+          scraping_bulk          1        1      12
+          cover_generation       1        1      20
+          enrichment             1        1      12
+          email                  1        1      16
+          cover_bulk             1        1       9
+          cover_workflow         1        1       9
+          cover_ranking          1        1       4
+          maintenance            1        1       4
+          cover_batch            1        1       1   (fixed — no KEDA)
+          ─────────────────────────────────────────
+          TOTAL                 13       13     167
         """
         data = await api("GET", "/admin/workers/performance-mode", cache_ttl=30)
         return fmt(data)

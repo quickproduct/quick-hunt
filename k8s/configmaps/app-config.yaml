@@ -39,13 +39,13 @@ data:
   VECTOR_DB_PROVIDER: "local"
 
   # --- Storage ---
-  S3_ENDPOINT_URL: "CHANGE_ME_TO_YOUR_R2_ENDPOINT"
+  S3_ENDPOINT_URL: "https://8c0ae864a440df58cc578994a1e37d71.r2.cloudflarestorage.com"
   S3_BUCKET_NAME: "jobhunter-resumes"
   S3_REGION: "auto"
 
   # --- Email ---
   EMAIL_PROVIDER: "brevo"
-  BREVO_FROM_EMAIL: "CHANGE_ME"
+  BREVO_FROM_EMAIL: "srshetty@surajshetty.online"
   BREVO_FROM_NAME: "Job Hunter"
   AUTO_SEND_ENABLED: "false"
 
@@ -59,7 +59,7 @@ data:
   LANGCHAIN_ENABLED: "true"
 
   # --- Frontend ---
-  FRONTEND_URL: "CHANGE_ME_TO_YOUR_DOMAIN"
+  FRONTEND_URL: "http://localhost:3001"
 
   # --- Beat schedule intervals (seconds) ---
   BEAT_SCRAPE_INTERVAL: "7200"

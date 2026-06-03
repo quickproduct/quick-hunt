@@ -7,8 +7,10 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 import {
   LayoutDashboard,
   Briefcase,
+  Building2,
   Search,
   Mail,
+  AtSign,
   Settings,
   CreditCard,
   Users,
@@ -21,6 +23,7 @@ import {
   User,
   ShieldOff,
   Send,
+  ListChecks,
 } from 'lucide-react';
 import { Toaster } from 'react-hot-toast';
 import { getAccessToken, clearTokens, getMe, type User as UserType } from '../lib/api';
@@ -32,8 +35,13 @@ const MAIN_NAV = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/candidates', label: 'Candidates', icon: UserCheck },
   { href: '/jobs', label: 'Jobs', icon: Briefcase },
+  { href: '/mnc-jobs', label: 'MNC Jobs', icon: Building2 },
+  { href: '/mnc-companies', label: 'MNC List', icon: ListChecks },
+  { href: '/consulting-jobs', label: 'Consulting Jobs', icon: Briefcase },
+  { href: '/consulting-companies', label: 'Consulting List', icon: Users },
   { href: '/search', label: 'Search', icon: Search },
   { href: '/logs', label: 'Send Logs', icon: Mail },
+  { href: '/hr-emails', label: 'HR Emails', icon: AtSign },
   { href: '/direct-send', label: 'Direct HR Send', icon: Send },
   { href: '/blacklist', label: 'Blacklist', icon: ShieldOff },
 ];
@@ -50,8 +58,13 @@ const PAGE_TITLES: Record<string, string> = {
   '/dashboard': 'Dashboard',
   '/candidates': 'Candidates',
   '/jobs': 'Jobs',
+  '/mnc-jobs': 'MNC Jobs',
+  '/mnc-companies': 'MNC List',
+  '/consulting-jobs': 'Consulting Jobs',
+  '/consulting-companies': 'Consulting List',
   '/search': 'Search',
   '/logs': 'Send Logs',
+  '/hr-emails': 'HR Email Analysis',
   '/direct-send': 'Direct HR Send',
   '/blacklist': 'Blacklist',
   '/settings': 'Settings',

@@ -325,6 +325,49 @@ class DirectSendLog(Base):
     )
 
 
+class HrEmail(Base):
+    __tablename__ = "hr_emails"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False)
+    email = Column(String(300), nullable=False)
+    domain = Column(String(200), nullable=False)
+
+    job_count = Column(Integer, default=0, nullable=False)
+    send_count = Column(Integer, default=0, nullable=False)
+    delivered_count = Column(Integer, default=0, nullable=False)
+    opened_count = Column(Integer, default=0, nullable=False)
+    clicked_count = Column(Integer, default=0, nullable=False)
+    hard_bounce_count = Column(Integer, default=0, nullable=False)
+    soft_bounce_count = Column(Integer, default=0, nullable=False)
+    blocked_count = Column(Integer, default=0, nullable=False)
+    spam_count = Column(Integer, default=0, nullable=False)
+
+    last_send_at = Column(DateTime, nullable=True)
+    last_bounce_at = Column(DateTime, nullable=True)
+    last_bounce_type = Column(String(20), nullable=True)   # hard|soft|blocked|spam
+    last_bounce_reason = Column(Text, nullable=True)
+
+    mx_valid = Column(Boolean, nullable=True)              # None = not yet checked
+    mx_checked_at = Column(DateTime, nullable=True)
+
+    # unknown | valid | invalid | bounced | fake
+    validation_status = Column(String(20), default="unknown", nullable=False)
+    is_placeholder = Column(Boolean, default=False, nullable=False)
+
+    first_seen_at = Column(DateTime, server_default=func.now(), nullable=False)
+    last_seen_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "email", name="uq_hr_emails_tenant_email"),
+        Index("ix_hr_emails_tenant_id", "tenant_id"),
+        Index("ix_hr_emails_domain", "domain"),
+        Index("ix_hr_emails_validation_status", "validation_status"),
+        Index("ix_hr_emails_tenant_domain", "tenant_id", "domain"),
+        Index("ix_hr_emails_last_bounce_at", "last_bounce_at"),
+    )
+
+
 class BlacklistedCompany(Base):
     __tablename__ = "blacklisted_companies"
 
@@ -339,6 +382,63 @@ class BlacklistedCompany(Base):
         UniqueConstraint("tenant_id", "name", name="uq_blacklist_tenant_name"),
         Index("ix_blacklisted_companies_tenant_id", "tenant_id"),
         Index("ix_blacklisted_companies_name", "name"),
+    )
+
+
+class MncCompany(Base):
+    """User-managed MNC company list — source of truth for MNC scraping.
+
+    Mirrors the BlacklistedCompany pattern: tenant-scoped rows plus a
+    SENTINEL_TENANT_ID row set seeded from `scraper/mnc_companies.py`.
+    The scraper loader merges sentinel + tenant rows, with tenant rows
+    shadowing sentinel rows by name (so a tenant can disable a default
+    by inserting a same-name row with active=False).
+    """
+    __tablename__ = "mnc_companies"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False,
+                       default=lambda: SENTINEL_TENANT_ID)
+    name = Column(String(300), nullable=False)
+    career_url = Column(String(1000), nullable=False)
+    ats = Column(String(40), nullable=False, default="custom")
+    ats_slug = Column(String(200), nullable=True)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_mnc_companies_tenant_name"),
+        Index("ix_mnc_companies_tenant_id", "tenant_id"),
+        Index("ix_mnc_companies_name", "name"),
+        Index("ix_mnc_companies_active", "active"),
+    )
+
+
+class ConsultingCompany(Base):
+    """Curated list of consulting / IT outsourcing / staffing firms.
+
+    Same sentinel + tenant-shadow pattern as MncCompany. Feeds the
+    consulting scraper, which tags results with source_portal='consulting_direct'.
+    """
+    __tablename__ = "consulting_companies"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    tenant_id = Column(String(36), ForeignKey("tenants.id"), nullable=False,
+                       default=lambda: SENTINEL_TENANT_ID)
+    name = Column(String(300), nullable=False)
+    career_url = Column(String(1000), nullable=False)
+    ats = Column(String(40), nullable=False, default="custom")
+    ats_slug = Column(String(200), nullable=True)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_consulting_companies_tenant_name"),
+        Index("ix_consulting_companies_tenant_id", "tenant_id"),
+        Index("ix_consulting_companies_name", "name"),
+        Index("ix_consulting_companies_active", "active"),
     )
 
 
