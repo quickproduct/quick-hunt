@@ -2,7 +2,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
 # ------------------------------------------------------------------ #
@@ -279,6 +279,109 @@ class BlacklistedCompanyOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ------------------------------------------------------------------ #
+# MNC company list schemas                                             #
+# ------------------------------------------------------------------ #
+_MNC_ATS_VALUES = {
+    "greenhouse", "lever", "smartrecruiters", "workday",
+    "icims", "taleo", "bamboohr", "custom",
+}
+_MNC_ATS_REQUIRES_SLUG = {"greenhouse", "lever", "smartrecruiters"}
+
+
+class MncCompanyBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=300)
+    career_url: str = Field(..., min_length=4, max_length=1000)
+    ats: str = Field(default="custom")
+    ats_slug: Optional[str] = Field(default=None, max_length=200)
+    active: bool = True
+
+    @model_validator(mode="after")
+    def _check_ats(self) -> "MncCompanyBase":
+        if self.ats not in _MNC_ATS_VALUES:
+            raise ValueError(
+                f"ats must be one of {sorted(_MNC_ATS_VALUES)}"
+            )
+        if self.ats in _MNC_ATS_REQUIRES_SLUG and not (self.ats_slug and self.ats_slug.strip()):
+            raise ValueError(f"ats_slug is required when ats is '{self.ats}'")
+        return self
+
+
+class MncCompanyCreate(MncCompanyBase):
+    pass
+
+
+class MncCompanyUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=300)
+    career_url: Optional[str] = Field(default=None, min_length=4, max_length=1000)
+    ats: Optional[str] = None
+    ats_slug: Optional[str] = Field(default=None, max_length=200)
+    active: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _check_ats(self) -> "MncCompanyUpdate":
+        if self.ats is not None and self.ats not in _MNC_ATS_VALUES:
+            raise ValueError(
+                f"ats must be one of {sorted(_MNC_ATS_VALUES)}"
+            )
+        # Slug-required validation happens at the router (needs current row context).
+        return self
+
+
+class MncCompanyOut(MncCompanyBase):
+    id: str
+    is_global: bool = False
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ConsultingCompanyBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=300)
+    career_url: str = Field(..., min_length=4, max_length=1000)
+    ats: str = Field(default="custom")
+    ats_slug: Optional[str] = Field(default=None, max_length=200)
+    active: bool = True
+
+    @model_validator(mode="after")
+    def _check_ats(self) -> "ConsultingCompanyBase":
+        if self.ats not in _MNC_ATS_VALUES:
+            raise ValueError(
+                f"ats must be one of {sorted(_MNC_ATS_VALUES)}"
+            )
+        if self.ats in _MNC_ATS_REQUIRES_SLUG and not (self.ats_slug and self.ats_slug.strip()):
+            raise ValueError(f"ats_slug is required when ats is '{self.ats}'")
+        return self
+
+
+class ConsultingCompanyCreate(ConsultingCompanyBase):
+    pass
+
+
+class ConsultingCompanyUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=300)
+    career_url: Optional[str] = Field(default=None, min_length=4, max_length=1000)
+    ats: Optional[str] = None
+    ats_slug: Optional[str] = Field(default=None, max_length=200)
+    active: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _check_ats(self) -> "ConsultingCompanyUpdate":
+        if self.ats is not None and self.ats not in _MNC_ATS_VALUES:
+            raise ValueError(
+                f"ats must be one of {sorted(_MNC_ATS_VALUES)}"
+            )
+        return self
+
+
+class ConsultingCompanyOut(ConsultingCompanyBase):
+    id: str
+    is_global: bool = False
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
 class TimelineEvent(BaseModel):
     """Single lifecycle event in a job's application timeline."""
     event: str          # scraped | scored | cover_generated | email_sent | delivered | opened | clicked
@@ -291,3 +394,69 @@ class TimelineEvent(BaseModel):
 class JobTimeline(BaseModel):
     job_id: str
     events: list[TimelineEvent]
+
+
+# ── HR Emails ─────────────────────────────────────────────────────────────────
+
+class HrEmailOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    tenant_id: str
+    email: str
+    domain: str
+    job_count: int
+    send_count: int
+    delivered_count: int
+    opened_count: int
+    clicked_count: int
+    hard_bounce_count: int
+    soft_bounce_count: int
+    blocked_count: int
+    spam_count: int
+    last_send_at: Optional[datetime] = None
+    last_bounce_at: Optional[datetime] = None
+    last_bounce_type: Optional[str] = None
+    last_bounce_reason: Optional[str] = None
+    mx_valid: Optional[bool] = None
+    mx_checked_at: Optional[datetime] = None
+    validation_status: str
+    is_placeholder: bool
+    first_seen_at: Optional[datetime] = None
+    last_seen_at: Optional[datetime] = None
+
+
+class HrEmailStats(BaseModel):
+    total_unique: int
+    valid_count: int
+    valid_pct: float
+    bounced_count: int
+    bounce_rate: float
+    fake_count: int
+    unknown_count: int
+    domains_with_bounces: int
+    total_sends: int
+    total_delivered: int
+
+
+class DomainAnalysisRow(BaseModel):
+    domain: str
+    email_count: int
+    send_count: int
+    bounce_count: int
+    bounce_rate: float
+    mx_valid: Optional[bool] = None
+
+
+class HrEmailPatch(BaseModel):
+    validation_status: Optional[str] = None
+
+
+class BrevoImportResult(BaseModel):
+    total_rows: int
+    unique_messages: int
+    unique_emails: int
+    send_logs_updated: int
+    jobs_updated: int
+    hr_emails_upserted: int
+    unmatched_messages: int

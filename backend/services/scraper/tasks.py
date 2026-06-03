@@ -374,27 +374,31 @@ async def _save_jobs_batch(
         return []
 
     # ── Stage 1.5: Date freshness filter (no DB work) ────────────────────
-    from services.scraper.date_filter import filter_jobs_by_freshness
+    from services.scraper.date_filter import filter_jobs_by_freshness, MAX_AGE_DAYS_HARD_CAP
     from services.api.core.config import get_settings
 
     _settings = get_settings()
-    max_age_days = _settings.max_job_age_days
+    hard_cap = getattr(_settings, "max_job_age_days_hard_cap", MAX_AGE_DAYS_HARD_CAP)
+    max_age_days = min(_settings.max_job_age_days, hard_cap)
     strict_mode = _settings.scrape_strict_date_mode
 
     try:
         from services.api.core.cache import cache_get
         override = await cache_get("admin:scrape_filter")
         if override and isinstance(override, dict):
-            max_age_days = override.get("max_job_age_days", max_age_days)
+            override_days = override.get("max_job_age_days", max_age_days)
+            # Clamp admin override so the UI can never relax past 3 months.
+            max_age_days = min(int(override_days), hard_cap)
             strict_mode = override.get("strict_date_mode", strict_mode)
     except Exception:
         pass
 
+    portal_name = jobs_data[0].get("source_portal", "unknown") if jobs_data else "unknown"
     fresh, date_stats = filter_jobs_by_freshness(
         relevant,
         max_age_days=max_age_days,
         strict=strict_mode,
-        portal=jobs_data[0].get("source_portal", "unknown") if jobs_data else "unknown",
+        portal=portal_name,
     )
     if date_stats.old_skipped > 0 or date_stats.date_unavailable > 0:
         logger.info(
@@ -403,6 +407,28 @@ async def _save_jobs_batch(
         )
     if not fresh:
         return []
+
+    # ── Stage 1.6: Role keyword filter (PHP/Python only) ─────────────────
+    if _settings.role_filter_enabled:
+        from services.scraper.role_filter import is_target_role
+        on_target: list[dict] = []
+        role_dropped = 0
+        for jd in fresh:
+            if is_target_role(jd.get("job_title", ""), jd.get("job_description")):
+                on_target.append(jd)
+            else:
+                role_dropped += 1
+        if role_dropped:
+            date_stats.role_filtered = role_dropped
+            logger.info(
+                "jobs_filtered_by_role",
+                portal=portal_name,
+                role_filtered=role_dropped,
+                kept=len(on_target),
+            )
+        fresh = on_target
+        if not fresh:
+            return []
 
     session_factory = get_worker_session_factory()
     async with session_factory() as session:
@@ -460,6 +486,18 @@ async def _save_jobs_batch(
         try:
             session.add_all(new_jobs)
             await session.commit()
+            # Upsert hr_emails registry for any jobs that arrived with an email set
+            from services.api.models.hr_email_utils import upsert_hr_email as _upsert_hr_email
+            for _j in new_jobs:
+                if _j.hr_email and _j.tenant_id:
+                    await _upsert_hr_email(
+                        session=session,
+                        tenant_id=_j.tenant_id,
+                        email=_j.hr_email,
+                        increment_job_count=True,
+                    )
+            if any(_j.hr_email for _j in new_jobs):
+                await session.commit()
             return [j.id for j in new_jobs]
         except IntegrityError:
             await session.rollback()
@@ -571,12 +609,26 @@ async def _update_search_task(
 # ------------------------------------------------------------------ #
 # Main scraping task                                                   #
 # ------------------------------------------------------------------ #
+def _scrape_lock_key(portal: str, query_dict: dict, candidate_id: str | None) -> str:
+    import hashlib
+    import json
+    payload = json.dumps(
+        {"p": portal, "q": query_dict, "c": candidate_id},
+        sort_keys=True, separators=(",", ":"),
+    )
+    digest = hashlib.sha1(payload.encode()).hexdigest()[:16]
+    return f"scrape:inflight:{portal}:{digest}"
+
+
+_SCRAPE_LOCK_TTL = 2000  # > task hard limit (1920s) — auto-expires on crash
+
+
 @celery_app.task(
     name="services.scraper.tasks.scrape_portal_task",
     bind=True,
     max_retries=3,
-    soft_time_limit=1800,  # 30 min — scrapers crawl many pages; global 600s was too tight
-    time_limit=1920,  # 32 min hard kill
+    soft_time_limit=300,  # 5 min — discovery only; detail fetches fan out to scrape_job_detail_task
+    time_limit=360,
 )
 def scrape_portal_task(
     self,
@@ -608,6 +660,11 @@ def scrape_portal_task(
         )
         return {"portal": portal, "saved": 0, "skipped": True, "reason": "unknown_portal"}
 
+    lock_key = _scrape_lock_key(portal, query_dict, candidate_id)
+    if not _run_async(_redis_set_nx(lock_key, self.request.id or "1", _SCRAPE_LOCK_TTL)):
+        logger.info("scrape_task_skipped_inflight", portal=portal, lock_key=lock_key)
+        return {"portal": portal, "saved": 0, "skipped": True, "reason": "inflight"}
+
     from services.scraper.base_adapter import JobQuery
 
     query = JobQuery(
@@ -621,84 +678,51 @@ def scrape_portal_task(
     adapter = registry[portal]()
 
     async def _run():
+        # Stage 1: discover — list jobs from the portal (cheap, one HTTP/Playwright call)
         raw_jobs = await adapter.search_jobs(query)
+        if not raw_jobs:
+            return 0
 
-        # Semaphore limits concurrent detail-page browser launches
-        sem = asyncio.Semaphore(6)
+        # Stage 2: pre-dedupe — drop jobs whose dedupe_hash already exists in DB
+        # BEFORE we pay the cost of a detail fetch. Single query, big savings.
+        new_raw_jobs = await _filter_unseen_jobs(raw_jobs)
+        dedup_dropped = len(raw_jobs) - len(new_raw_jobs)
+        if not new_raw_jobs:
+            logger.info(
+                "scrape_portal_summary",
+                portal=portal,
+                total_scraped=len(raw_jobs),
+                pre_dedup_dropped=dedup_dropped,
+                saved=0,
+                fanned_out=0,
+            )
+            return 0
 
-        async def enrich_job(raw_job) -> dict | None:
-            """Fetch detail page (if needed) and return job_data dict or None."""
-            async with sem:
-                if not raw_job.job_description:
-                    try:
-                        detailed = await adapter.parse_job_detail(raw_job.job_url)
-                        if detailed:
-                            raw_job.job_description = detailed.job_description
-                            raw_job.hr_email = raw_job.hr_email or detailed.hr_email
-                            raw_job.company_website = (
-                                raw_job.company_website or detailed.company_website
-                            )
-                    except Exception as exc:
-                        logger.warning(
-                            "detail_fetch_failed", url=raw_job.job_url, error=str(exc)
-                        )
+        # Stage 3: split into "complete" (has description) vs "needs detail".
+        # Complete jobs are saved here in one batch — no fan-out needed.
+        # Needs-detail jobs are dispatched as parallel scrape_job_detail_task
+        # so the discover task stays fast and detail work scales horizontally.
+        complete: list[dict] = []
+        needs_detail: list[dict] = []
+        for rj in new_raw_jobs:
+            payload = _raw_job_to_payload(rj)
+            (complete if rj.job_description else needs_detail).append(payload)
 
-                # HR email discovery is intentionally skipped here —
-                # the hourly backfill_hr_emails_task handles it without
-                # blocking the scraping pipeline.
+        saved_job_ids = await _save_jobs_batch(complete, candidate_id) if complete else []
 
-                return {
-                    "job_title": raw_job.job_title,
-                    "company": raw_job.company,
-                    "location": raw_job.location,
-                    "job_description": raw_job.job_description,
-                    "job_url": raw_job.job_url,
-                    "posted_date": raw_job.posted_date,
-                    "hr_email": raw_job.hr_email,
-                    "company_website": raw_job.company_website,
-                    "recruiter_name": raw_job.recruiter_name,
-                    "source_portal": raw_job.source_portal,
-                    "dedupe_hash": raw_job.dedupe_hash,
-                    "salary_min": raw_job.salary_min,
-                    "salary_max": raw_job.salary_max,
-                    "salary_currency": raw_job.salary_currency,
-                    "job_type": raw_job.job_type,
-                    "experience_required": raw_job.experience_required,
-                    "raw_data": raw_job.raw_data,
-                }
+        # Stage 4: fan out detail fetches as individual tasks
+        if needs_detail:
+            bp = BatchPublisher(chunk_size=50)
+            for payload in needs_detail:
+                bp.add(scrape_job_detail_task.s(
+                    raw_job_payload=payload,
+                    candidate_id=candidate_id,
+                    auto_generate_covers=auto_generate_covers,
+                ))
+            bp.flush_with_stagger(base_countdown=1, stagger_seconds=0.05)
 
-        # Stage 1: Enrich all jobs concurrently (fetch detail pages)
-        enrich_results = await asyncio.gather(
-            *[enrich_job(j) for j in raw_jobs], return_exceptions=True
-        )
-
-        # Collect successfully enriched job data
-        all_job_data: list[dict] = []
-        for result in enrich_results:
-            if isinstance(result, dict):
-                all_job_data.append(result)
-
-        # Stage 2: Bulk insert all jobs in one transaction
-        saved_job_ids = await _save_jobs_batch(all_job_data, candidate_id)
-        saved_count = len(saved_job_ids)
-
-        logger.info(
-            "scrape_portal_summary",
-            portal=portal,
-            total_scraped=len(all_job_data),
-            saved=saved_count,
-            old_or_dupes_skipped=len(all_job_data) - saved_count,
-        )
-
+        # Stage 5: enqueue downstream for jobs saved in this task
         if saved_job_ids:
-
-            # Stage 3: Batch dispatch downstream tasks using BatchPublisher
-            # to avoid flooding the broker with individual apply_async calls.
-            #
-            # score_job_task replaces run_application_workflow_task:
-            # - 1 LLM call (score only) vs 2 (score + generate_cover)
-            # - Cover generation is handled by fill_missing_covers_task cron
-            # - Eliminates jh_cover_letter_workflow queue backlog
             from services.ai.tasks import generate_embedding_task, score_job_task
 
             bp = BatchPublisher(chunk_size=50)
@@ -708,7 +732,15 @@ def scrape_portal_task(
                     bp.add(score_job_task.s(job_id, candidate_id))
             bp.flush_with_stagger(base_countdown=2, stagger_seconds=0.1)
 
-        return saved_count
+        logger.info(
+            "scrape_portal_summary",
+            portal=portal,
+            total_scraped=len(raw_jobs),
+            pre_dedup_dropped=dedup_dropped,
+            saved=len(saved_job_ids),
+            fanned_out=len(needs_detail),
+        )
+        return len(saved_job_ids) + len(needs_detail)
 
     try:
         result = _run_async(_run())
@@ -725,6 +757,7 @@ def scrape_portal_task(
                     search_task_id, {"status": "error", "error": f"Scrape timed out for portal {portal}"}
                 )
             )
+        _run_async(_redis_delete(lock_key))
         retry_delay = min(60 * (2**self.request.retries), 240) + random.randint(0, 30)
         raise self.retry(exc=exc, countdown=retry_delay)
     except Exception as exc:
@@ -735,9 +768,14 @@ def scrape_portal_task(
                     search_task_id, {"status": "error", "error": str(exc)}
                 )
             )
+        _run_async(_redis_delete(lock_key))
         # Exponential backoff with jitter: 60s, 120s, 240s (max 4 min), ±30s jitter
         retry_delay = min(60 * (2**self.request.retries), 240) + random.randint(0, 30)
         raise self.retry(exc=exc, countdown=retry_delay)
+    finally:
+        # Best-effort release on the happy path; SoftTimeLimitExceeded / generic
+        # failure branches already released above before re-raising via retry().
+        _run_async(_redis_delete(lock_key))
 
     if search_task_id:
         _run_async(
@@ -750,6 +788,536 @@ def scrape_portal_task(
 
     logger.info("scrape_task_complete", portal=portal, saved=saved_count)
     return {"portal": portal, "saved": saved_count}
+
+
+# ------------------------------------------------------------------ #
+# Discover/detail split helpers + scrape_job_detail_task               #
+# ------------------------------------------------------------------ #
+
+def _raw_job_to_payload(rj) -> dict:
+    """Serialize a RawJob into a JSON-safe dict for Celery transport."""
+    pd = rj.posted_date
+    return {
+        "job_title": rj.job_title,
+        "company": rj.company,
+        "location": rj.location,
+        "job_description": rj.job_description,
+        "job_url": rj.job_url,
+        "posted_date": pd.isoformat() if pd is not None else None,
+        "hr_email": rj.hr_email,
+        "company_website": rj.company_website,
+        "recruiter_name": rj.recruiter_name,
+        "source_portal": rj.source_portal,
+        "dedupe_hash": rj.dedupe_hash,
+        "salary_min": rj.salary_min,
+        "salary_max": rj.salary_max,
+        "salary_currency": rj.salary_currency,
+        "job_type": rj.job_type,
+        "experience_required": rj.experience_required,
+        "raw_data": rj.raw_data,
+    }
+
+
+def _payload_to_job_data(payload: dict) -> dict:
+    """Inverse of _raw_job_to_payload — restores datetime, leaves the rest as-is."""
+    out = dict(payload)
+    pd = out.get("posted_date")
+    if isinstance(pd, str):
+        try:
+            out["posted_date"] = datetime.fromisoformat(pd)
+        except ValueError:
+            out["posted_date"] = None
+    return out
+
+
+async def _filter_unseen_jobs(raw_jobs: list) -> list:
+    """Return only RawJobs whose dedupe_hash is not already in the DB.
+
+    Single SELECT for the whole batch — cheap. Saves expensive detail fetches
+    on jobs we've already scraped on a prior run.
+    """
+    if not raw_jobs:
+        return []
+    from sqlalchemy import select
+    from services.api.core.database import get_worker_session_factory
+    from services.api.models.db import Job
+
+    hashes = [rj.dedupe_hash for rj in raw_jobs if rj.dedupe_hash]
+    if not hashes:
+        return list(raw_jobs)
+
+    session_factory = get_worker_session_factory()
+    async with session_factory() as session:
+        result = await session.execute(
+            select(Job.dedupe_hash).where(Job.dedupe_hash.in_(hashes))
+        )
+        existing = {row[0] for row in result.all()}
+    return [rj for rj in raw_jobs if rj.dedupe_hash not in existing]
+
+
+@celery_app.task(
+    name="services.scraper.tasks.scrape_job_detail_task",
+    bind=True,
+    max_retries=2,
+    soft_time_limit=120,
+    time_limit=180,
+)
+def scrape_job_detail_task(
+    self,
+    raw_job_payload: dict,
+    candidate_id: str | None = None,
+    auto_generate_covers: bool = False,
+) -> dict:
+    """Fetch the detail page for one job, persist it, dispatch downstream tasks.
+
+    Spun out from scrape_portal_task: each portal scrape used to fetch N
+    detail pages sequentially under a single 30-min task. Now each detail
+    is its own short task that can run in parallel across workers.
+    """
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        task_id=self.request.id,
+        task_name=self.name,
+        worker_id=self.request.hostname,
+    )
+
+    portal = raw_job_payload.get("source_portal")
+    url = raw_job_payload.get("job_url")
+    registry = get_adapter_registry()
+    if not portal or portal not in registry:
+        logger.warning("detail_task_skipped_unknown_portal", portal=portal, url=url)
+        return {"saved": 0, "skipped": True, "reason": "unknown_portal"}
+
+    adapter = registry[portal]()
+
+    async def _run() -> int:
+        job_data = _payload_to_job_data(raw_job_payload)
+        if not job_data.get("job_description"):
+            try:
+                detailed = await adapter.parse_job_detail(url)
+                if detailed:
+                    job_data["job_description"] = detailed.job_description
+                    job_data["hr_email"] = job_data.get("hr_email") or detailed.hr_email
+                    job_data["company_website"] = (
+                        job_data.get("company_website") or detailed.company_website
+                    )
+            except Exception as exc:
+                logger.warning("detail_fetch_failed", url=url, error=str(exc))
+
+        saved_ids = await _save_jobs_batch([job_data], candidate_id)
+        if saved_ids:
+            from services.ai.tasks import generate_embedding_task, score_job_task
+            bp = BatchPublisher(chunk_size=10)
+            for job_id in saved_ids:
+                bp.add(generate_embedding_task.s(job_id))
+                if candidate_id:
+                    bp.add(score_job_task.s(job_id, candidate_id))
+            bp.flush_with_stagger(base_countdown=2, stagger_seconds=0.1)
+        return len(saved_ids)
+
+    try:
+        saved = _run_async(_run())
+    except SoftTimeLimitExceeded as exc:
+        logger.warning("detail_task_timeout", url=url, portal=portal)
+        retry_delay = min(30 * (2**self.request.retries), 180) + random.randint(0, 15)
+        raise self.retry(exc=exc, countdown=retry_delay)
+    except Exception as exc:
+        log_exception(logger, "detail_task_failed", exc, url=url, portal=portal)
+        retry_delay = min(30 * (2**self.request.retries), 180) + random.randint(0, 15)
+        raise self.retry(exc=exc, countdown=retry_delay)
+
+    return {"saved": saved, "portal": portal, "url": url}
+
+
+# ------------------------------------------------------------------ #
+# MNC direct career-page scrape tasks                                  #
+# ------------------------------------------------------------------ #
+#
+# Architecture (new, dispatch + fan-out):
+#
+#   dispatch_task  ──►  group(per-company tasks)  ──►  finalize_task
+#   (lightweight)        (Playwright-capable,          (lightweight,
+#                         KEDA scales 0→6)              releases lock)
+#
+# Per-tenant Redis lock prevents duplicate full scrapes.
+# Per-company tasks save jobs + enqueue embeddings/scoring immediately,
+# so partial progress survives any single-company failure or pod kill.
+# ------------------------------------------------------------------ #
+
+_MNC_LOCK_KEY = "mnc:scrape:lock:{tenant_id}"
+_MNC_PROGRESS_KEY = "mnc:scrape:progress:{tenant_id}"
+_MNC_LOCK_TTL = 3600  # 1 hour — self-heal on crashes
+
+
+def _resolve_default_tenant_id() -> str:
+    """Fallback tenant lookup for callers that don't pass one explicitly."""
+    async def _fetch() -> str | None:
+        from sqlalchemy import select
+        from services.api.core.database import get_worker_session_factory
+        from services.api.models.db import Tenant  # type: ignore
+
+        sf = get_worker_session_factory()
+        async with sf() as session:
+            row = (await session.execute(
+                select(Tenant.id).order_by(Tenant.created_at.asc()).limit(1)
+            )).first()
+            return str(row[0]) if row else None
+    try:
+        tid = _run_async(_fetch())
+        return tid or "default"
+    except Exception:
+        return "default"
+
+
+async def _redis_set_nx(key: str, value: str, ttl: int) -> bool:
+    """Try to acquire a Redis lock atomically. Returns True if acquired."""
+    from services.api.core.cache import get_redis
+    r = await get_redis()
+    if r is None:
+        # Fail-open: if Redis is unavailable we still allow the scrape,
+        # mirroring the existing cache helpers' fail-open behaviour.
+        return True
+    try:
+        return bool(await r.set(key, value, nx=True, ex=ttl))
+    except Exception:
+        return True
+
+
+async def _redis_delete(key: str) -> None:
+    from services.api.core.cache import get_redis
+    r = await get_redis()
+    if r is None:
+        return
+    try:
+        await r.delete(key)
+    except Exception:
+        pass
+
+
+async def _redis_hincrby(key: str, field: str, by: int = 1, ttl: int = _MNC_LOCK_TTL) -> None:
+    from services.api.core.cache import get_redis
+    r = await get_redis()
+    if r is None:
+        return
+    try:
+        await r.hincrby(key, field, by)
+        await r.expire(key, ttl)
+    except Exception:
+        pass
+
+
+async def _redis_hset(key: str, mapping: dict, ttl: int = _MNC_LOCK_TTL) -> None:
+    from services.api.core.cache import get_redis
+    r = await get_redis()
+    if r is None:
+        return
+    try:
+        await r.hset(key, mapping=mapping)
+        await r.expire(key, ttl)
+    except Exception:
+        pass
+
+
+# ── 1. Dispatcher task ────────────────────────────────────────────────
+@celery_app.task(
+    name="services.scraper.tasks.mnc_scrape_dispatch_task",
+    bind=True,
+    max_retries=0,
+    soft_time_limit=60,
+    time_limit=90,
+    acks_late=True,
+)
+def mnc_scrape_dispatch_task(
+    self,
+    candidate_id: str | None = None,
+    tenant_id: str | None = None,
+    max_companies: int = 1000,
+) -> dict:
+    """Grab a per-tenant lock and fan out one Celery task per MNC company.
+
+    Returns immediately after enqueuing the group; the chord callback
+    `mnc_scrape_finalize_task` releases the lock when all per-company
+    tasks finish (or fail individually).
+    """
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        task_id=self.request.id,
+        task_name=self.name,
+        worker_id=self.request.hostname,
+    )
+
+    tid = tenant_id or _resolve_default_tenant_id()
+    lock_key = _MNC_LOCK_KEY.format(tenant_id=tid)
+    progress_key = _MNC_PROGRESS_KEY.format(tenant_id=tid)
+    dispatch_id = self.request.id
+
+    acquired = _run_async(_redis_set_nx(lock_key, dispatch_id, _MNC_LOCK_TTL))
+    if not acquired:
+        logger.info("mnc_scrape_dispatch_skipped_already_running", tenant_id=tid)
+        return {"status": "already_running", "tenant_id": tid}
+
+    from celery import chord, group
+    from services.scraper.mnc_company_loader import load_active_mnc_companies
+
+    companies = _run_async(load_active_mnc_companies(tid))
+    if max_companies and max_companies < len(companies):
+        companies = companies[:max_companies]
+
+    if not companies:
+        logger.warning("mnc_scrape_dispatch_no_companies", tenant_id=tid)
+        # Release the lock immediately so the user can retry once they add rows.
+        _run_async(_redis_delete(lock_key))
+        return {"status": "no_companies", "tenant_id": tid, "dispatch_id": dispatch_id}
+
+    total = len(companies)
+
+    # Initialise progress hash so the status endpoint can show 0/total immediately.
+    _run_async(_redis_hset(progress_key, {
+        "dispatch_id": dispatch_id,
+        "candidate_id": candidate_id or "",
+        "total": total,
+        "done": 0,
+        "saved": 0,
+        "started_at": _utcnow().isoformat(),
+    }))
+
+    header = group(
+        mnc_scrape_company_task.s(
+            company=company,
+            candidate_id=candidate_id,
+            tenant_id=tid,
+            dispatch_id=dispatch_id,
+        )
+        for company in companies
+    )
+    callback = mnc_scrape_finalize_task.s(
+        candidate_id=candidate_id,
+        tenant_id=tid,
+        dispatch_id=dispatch_id,
+    )
+    chord(header)(callback)
+
+    logger.info("mnc_scrape_dispatched", tenant_id=tid, dispatch_id=dispatch_id, companies=total)
+    return {
+        "status": "queued",
+        "tenant_id": tid,
+        "dispatch_id": dispatch_id,
+        "companies": total,
+    }
+
+
+# ── 2. Per-company task ───────────────────────────────────────────────
+@celery_app.task(
+    name="services.scraper.tasks.mnc_scrape_company_task",
+    bind=True,
+    max_retries=1,
+    default_retry_delay=30,
+    soft_time_limit=240,   # 4 min — mnc_career.py already wraps each call at 180s
+    time_limit=300,
+    acks_late=True,
+)
+def mnc_scrape_company_task(
+    self,
+    company: dict,
+    candidate_id: str | None,
+    tenant_id: str | None,
+    dispatch_id: str,
+) -> dict:
+    """Scrape one MNC company, persist jobs immediately, dispatch embeddings + scoring."""
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        task_id=self.request.id,
+        task_name=self.name,
+        worker_id=self.request.hostname,
+        dispatch_id=dispatch_id,
+        company=company.get("name"),
+    )
+
+    from services.scraper.adapters.mnc_career import MNCCareerAdapter
+    adapter = MNCCareerAdapter()
+    progress_key = _MNC_PROGRESS_KEY.format(tenant_id=tenant_id or "default")
+
+    async def _run() -> dict:
+        # Use a per-task httpx client so workers don't share state.
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+            try:
+                raw_jobs = await asyncio.wait_for(
+                    adapter._scrape_company(client, company),
+                    timeout=180,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("mnc_company_timeout", company=company.get("name"))
+                raw_jobs = []
+            except Exception as exc:
+                logger.warning("mnc_company_error", company=company.get("name"), error=str(exc))
+                raw_jobs = []
+
+        if not raw_jobs:
+            await _redis_hincrby(progress_key, "done", 1)
+            return {"company": company.get("name"), "saved": 0, "raw": 0}
+
+        job_data_list = [
+            {
+                "job_title": j.job_title,
+                "company": j.company,
+                "location": j.location,
+                "job_description": j.job_description,
+                "job_url": j.job_url,
+                "posted_date": j.posted_date,
+                "hr_email": j.hr_email,
+                "company_website": j.company_website,
+                "recruiter_name": j.recruiter_name,
+                "source_portal": j.source_portal,
+                "dedupe_hash": j.dedupe_hash,
+                "salary_min": j.salary_min,
+                "salary_max": j.salary_max,
+                "salary_currency": j.salary_currency,
+                "job_type": j.job_type,
+                "experience_required": j.experience_required,
+                "raw_data": j.raw_data,
+            }
+            for j in raw_jobs
+        ]
+
+        saved_job_ids = await _save_jobs_batch(job_data_list, candidate_id)
+        saved_count = len(saved_job_ids)
+
+        # Dispatch downstream immediately — no need to wait for the chord callback.
+        if saved_job_ids:
+            from services.ai.tasks import generate_embedding_task, score_job_task
+            bp = BatchPublisher(chunk_size=50)
+            for job_id in saved_job_ids:
+                bp.add(generate_embedding_task.s(job_id))
+                if candidate_id:
+                    bp.add(score_job_task.s(job_id, candidate_id))
+            bp.flush_with_stagger(base_countdown=2, stagger_seconds=0.1)
+
+        await _redis_hincrby(progress_key, "done", 1)
+        if saved_count:
+            await _redis_hincrby(progress_key, "saved", saved_count)
+
+        return {
+            "company": company.get("name"),
+            "saved": saved_count,
+            "raw": len(raw_jobs),
+        }
+
+    try:
+        return _run_async(_run())
+    except SoftTimeLimitExceeded:
+        logger.warning("mnc_company_task_soft_timeout", company=company.get("name"))
+        _run_async(_redis_hincrby(progress_key, "done", 1))
+        return {"company": company.get("name"), "saved": 0, "raw": 0, "timeout": True}
+    except Exception as exc:
+        log_exception(logger, "mnc_company_task_failed", exc, company=company.get("name"))
+        # Still mark done so the dispatcher's progress counter advances.
+        try:
+            _run_async(_redis_hincrby(progress_key, "done", 1))
+        except Exception:
+            pass
+        return {"company": company.get("name"), "saved": 0, "raw": 0, "error": str(exc)}
+
+
+# ── 3. Chord callback ─────────────────────────────────────────────────
+@celery_app.task(
+    name="services.scraper.tasks.mnc_scrape_finalize_task",
+    bind=True,
+    max_retries=0,
+    soft_time_limit=120,
+    time_limit=180,
+    acks_late=True,
+)
+def mnc_scrape_finalize_task(
+    self,
+    results: list[dict],
+    candidate_id: str | None = None,
+    tenant_id: str | None = None,
+    dispatch_id: str | None = None,
+) -> dict:
+    """Aggregate per-company results, release the Redis lock."""
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        task_id=self.request.id,
+        task_name=self.name,
+        worker_id=self.request.hostname,
+        dispatch_id=dispatch_id,
+    )
+
+    total_saved = sum(int(r.get("saved", 0) or 0) for r in (results or []))
+    total_raw = sum(int(r.get("raw", 0) or 0) for r in (results or []))
+    companies = len(results or [])
+    timeouts = sum(1 for r in (results or []) if r.get("timeout"))
+    errors = sum(1 for r in (results or []) if r.get("error"))
+
+    tid = tenant_id or _resolve_default_tenant_id()
+    lock_key = _MNC_LOCK_KEY.format(tenant_id=tid)
+    progress_key = _MNC_PROGRESS_KEY.format(tenant_id=tid)
+
+    async def _finalize() -> None:
+        await _redis_hset(progress_key, {
+            "finished_at": _utcnow().isoformat(),
+            "final_saved": total_saved,
+            "final_raw": total_raw,
+            "final_companies": companies,
+            "final_timeouts": timeouts,
+            "final_errors": errors,
+        }, ttl=600)  # keep finished progress visible for 10 min
+        await _redis_delete(lock_key)
+
+    try:
+        _run_async(_finalize())
+    except Exception as exc:
+        log_exception(logger, "mnc_scrape_finalize_redis_error", exc)
+
+    logger.info(
+        "mnc_scrape_finalize",
+        tenant_id=tid,
+        dispatch_id=dispatch_id,
+        companies=companies,
+        saved=total_saved,
+        raw=total_raw,
+        timeouts=timeouts,
+        errors=errors,
+    )
+    return {
+        "portal": "mnc_direct",
+        "tenant_id": tid,
+        "dispatch_id": dispatch_id,
+        "companies": companies,
+        "saved": total_saved,
+        "raw": total_raw,
+        "timeouts": timeouts,
+        "errors": errors,
+    }
+
+
+# ── Backwards-compat shim ─────────────────────────────────────────────
+@celery_app.task(
+    name="services.scraper.tasks.scrape_mnc_jobs_task",
+    bind=True,
+    max_retries=0,
+    soft_time_limit=60,
+    time_limit=90,
+)
+def scrape_mnc_jobs_task(
+    self,
+    candidate_id: str | None = None,
+    tenant_id: str | None = None,
+    max_companies: int = 1000,
+) -> dict:
+    """Legacy entry point — now just kicks off the dispatch task.
+
+    Kept so any existing callers (cron, manual MCP, old API code-paths) continue to work.
+    """
+    res = mnc_scrape_dispatch_task.apply_async(
+        kwargs={
+            "candidate_id": candidate_id,
+            "tenant_id": tenant_id,
+            "max_companies": max_companies,
+        },
+        queue="jh_scraping_mnc_dispatch",
+    )
+    return {"status": "dispatched", "dispatch_task_id": res.id}
 
 
 # ------------------------------------------------------------------ #
@@ -1303,77 +1871,94 @@ _GUESS_SKIP_DOMAINS = {
     "taleo.net",
     "brassring.com",
     "smartrecruiters.com",
+    # Disposable / placeholder domains — never valid HR addresses
+    "example.com",
+    "example.org",
+    "example.net",
+    "sentry.io",
+    "mailinator.com",
+    "guerrillamail.com",
+    "tempmail.com",
+    "10minutemail.com",
+    "yopmail.com",
+    "trashmail.com",
 }
 
 
 _HR_EMAIL_PREFIXES = ["hr", "careers", "recruit", "talent", "hiring", "jobs", "people"]
 
+# Tri-state SMTP probe result
+SMTP_VERIFIED = "verified"     # mailbox exists (250/251/252)
+SMTP_REJECTED = "rejected"     # mailbox does not exist (5xx)
+SMTP_UNVERIFIED = "unverified"  # timeout / unknown code / no MX — DO NOT trust
 
-async def _smtp_probe_email(email: str, domain: str) -> bool:
-    """SMTP probe — returns True if the mailbox likely exists.
+
+async def _smtp_probe_email(email: str, domain: str) -> str:
+    """SMTP probe — tri-state result.
 
     Connects to the domain's MX server and issues RCPT TO without sending
-    any message.  Treat unknown/timeout as True (fail-open) so we never
-    silently discard a valid address.
+    any message. Returns SMTP_VERIFIED only on a definitive 2xx accept.
+    Timeouts, unknown codes, and missing MX return SMTP_UNVERIFIED so the
+    caller can refuse to persist the candidate as a real HR email.
 
-    250/251 → exists   |   550/551/552/553/554 → does not exist
-    anything else (including timeouts) → assume exists (fail-open)
+    250/251/252 → SMTP_VERIFIED
+    550/551/552/553/554 → SMTP_REJECTED
+    anything else (timeout, no MX, conn refused) → SMTP_UNVERIFIED
     """
     import asyncio
-    import socket
 
     try:
-        # Resolve MX
         loop = asyncio.get_event_loop()
         mx_records = await loop.run_in_executor(None, _resolve_mx_sync, domain)
         if not mx_records:
-            return True  # no MX → fail-open
-        # Pick lowest-preference MX
+            return SMTP_UNVERIFIED
         mx_host = str(sorted(mx_records, key=lambda r: r.preference)[0].exchange).rstrip(".")
     except Exception:
-        return True
+        return SMTP_UNVERIFIED
 
-    async def _probe() -> bool:
+    async def _probe() -> str:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(mx_host, 25), timeout=5
             )
+
             async def _readline() -> str:
                 return (await asyncio.wait_for(reader.readline(), timeout=5)).decode(errors="ignore").strip()
+
             async def _send(cmd: str) -> str:
                 writer.write((cmd + "\r\n").encode())
                 await writer.drain()
                 return await _readline()
 
             await _readline()  # banner
-            await _send(f"EHLO probe.example.com")
-            await _readline()  # may be multi-line; read one more line
-            await _send(f"MAIL FROM:<probe@example.com>")
+            await _send("EHLO probe.example.com")
+            await _readline()
+            await _send("MAIL FROM:<probe@example.com>")
             resp = await _send(f"RCPT TO:<{email}>")
             writer.write(b"QUIT\r\n")
             await writer.drain()
             writer.close()
             code = int(resp[:3]) if resp[:3].isdigit() else 0
             if code in (250, 251, 252):
-                return True
+                return SMTP_VERIFIED
             if code in (550, 551, 552, 553, 554):
-                return False
-            return True  # unknown code → fail-open
+                return SMTP_REJECTED
+            return SMTP_UNVERIFIED
         except Exception:
-            return True  # timeout or connection refused → fail-open
+            return SMTP_UNVERIFIED
 
     try:
         return await asyncio.wait_for(_probe(), timeout=10)
     except Exception:
-        return True
+        return SMTP_UNVERIFIED
 
 
 async def _guess_emails_from_domain(domain: str) -> str | None:
-    """Return the most likely HR email address for a domain.
+    """Return a verified HR email for the domain, or None.
 
-    Tries common HR prefixes in order, using SMTP probing to verify each.
-    Falls back to hr@ without probing when SMTP is unavailable.
-    Last-resort step — only called when every other discovery method fails.
+    Tries common HR prefixes in order, requiring SMTP_VERIFIED before
+    returning. Never falls back to an unverified guess — fake addresses
+    are the primary source of bounces.
     """
     if not domain:
         return None
@@ -1383,10 +1968,10 @@ async def _guess_emails_from_domain(domain: str) -> str | None:
 
     for prefix in _HR_EMAIL_PREFIXES:
         candidate = f"{prefix}@{domain}"
-        if await _smtp_probe_email(candidate, domain):
+        if await _smtp_probe_email(candidate, domain) == SMTP_VERIFIED:
             return candidate
 
-    return f"hr@{domain}"  # final fallback (no verification)
+    return None
 
 
 async def _discover_email_for_job(
@@ -1715,6 +2300,13 @@ def backfill_hr_emails_task() -> dict:
                                     db_job.hr_email = email
                                     db_job.hr_email_discovery_status = "found"
                                     db_job.hr_email_discovered_at = _utcnow()
+                                    from services.api.models.hr_email_utils import upsert_hr_email as _upsert_hr_email
+                                    await _upsert_hr_email(
+                                        session=session,
+                                        tenant_id=db_job.tenant_id,
+                                        email=email,
+                                        increment_job_count=True,
+                                    )
                                 elif new_attempts >= MAX_ATTEMPTS:
                                     db_job.hr_email_discovery_status = "unreachable"
                                 else:
@@ -1905,6 +2497,13 @@ def fix_placeholder_emails_task() -> dict:
                                 db_job.hr_email = email
                                 db_job.hr_email_discovery_status = "found"
                                 db_job.hr_email_discovered_at = _utcnow()
+                                from services.api.models.hr_email_utils import upsert_hr_email as _upsert_hr_email
+                                await _upsert_hr_email(
+                                    session=session,
+                                    tenant_id=db_job.tenant_id,
+                                    email=email,
+                                    increment_job_count=True,
+                                )
                             else:
                                 # Clear placeholder — backfill_hr_emails_task will retry
                                 db_job.hr_email = None
@@ -2387,3 +2986,302 @@ def stale_lock_reaper_task() -> dict:
         return {"status": "ok", **reaped}
 
     return _run_async(_run())
+
+
+# ====================================================================== #
+# Consulting / IT outsourcing scrape pipeline                              #
+# ====================================================================== #
+# Mirror of the MNC pipeline (dispatch → fan-out → finalize). Uses a
+# separate Redis lock namespace and separate Celery queues so it can run
+# concurrently with the MNC scrape on shared workers.
+
+_CONSULTING_LOCK_KEY = "consulting:scrape:lock:{tenant_id}"
+_CONSULTING_PROGRESS_KEY = "consulting:scrape:progress:{tenant_id}"
+
+
+@celery_app.task(
+    name="services.scraper.tasks.consulting_scrape_dispatch_task",
+    bind=True,
+    max_retries=0,
+    soft_time_limit=60,
+    time_limit=90,
+    acks_late=True,
+)
+def consulting_scrape_dispatch_task(
+    self,
+    candidate_id: str | None = None,
+    tenant_id: str | None = None,
+    max_companies: int = 1000,
+) -> dict:
+    """Grab per-tenant lock and fan out one Celery task per consulting company."""
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        task_id=self.request.id,
+        task_name=self.name,
+        worker_id=self.request.hostname,
+    )
+
+    tid = tenant_id or _resolve_default_tenant_id()
+    lock_key = _CONSULTING_LOCK_KEY.format(tenant_id=tid)
+    progress_key = _CONSULTING_PROGRESS_KEY.format(tenant_id=tid)
+    dispatch_id = self.request.id
+
+    acquired = _run_async(_redis_set_nx(lock_key, dispatch_id, _MNC_LOCK_TTL))
+    if not acquired:
+        logger.info("consulting_scrape_dispatch_skipped_already_running", tenant_id=tid)
+        return {"status": "already_running", "tenant_id": tid}
+
+    from celery import chord, group
+    from services.scraper.consulting_company_loader import load_active_consulting_companies
+
+    companies = _run_async(load_active_consulting_companies(tid))
+    if max_companies and max_companies < len(companies):
+        companies = companies[:max_companies]
+
+    if not companies:
+        logger.warning("consulting_scrape_dispatch_no_companies", tenant_id=tid)
+        _run_async(_redis_delete(lock_key))
+        return {"status": "no_companies", "tenant_id": tid, "dispatch_id": dispatch_id}
+
+    total = len(companies)
+    _run_async(_redis_hset(progress_key, {
+        "dispatch_id": dispatch_id,
+        "candidate_id": candidate_id or "",
+        "total": total,
+        "done": 0,
+        "saved": 0,
+        "started_at": _utcnow().isoformat(),
+    }))
+
+    header = group(
+        consulting_scrape_company_task.s(
+            company=company,
+            candidate_id=candidate_id,
+            tenant_id=tid,
+            dispatch_id=dispatch_id,
+        )
+        for company in companies
+    )
+    callback = consulting_scrape_finalize_task.s(
+        candidate_id=candidate_id,
+        tenant_id=tid,
+        dispatch_id=dispatch_id,
+    )
+    chord(header)(callback)
+
+    logger.info("consulting_scrape_dispatched", tenant_id=tid, dispatch_id=dispatch_id, companies=total)
+    return {
+        "status": "queued",
+        "tenant_id": tid,
+        "dispatch_id": dispatch_id,
+        "companies": total,
+    }
+
+
+@celery_app.task(
+    name="services.scraper.tasks.consulting_scrape_company_task",
+    bind=True,
+    max_retries=1,
+    default_retry_delay=30,
+    soft_time_limit=240,
+    time_limit=300,
+    acks_late=True,
+)
+def consulting_scrape_company_task(
+    self,
+    company: dict,
+    candidate_id: str | None,
+    tenant_id: str | None,
+    dispatch_id: str,
+) -> dict:
+    """Scrape one consulting/outsourcing company, persist jobs, dispatch scoring."""
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        task_id=self.request.id,
+        task_name=self.name,
+        worker_id=self.request.hostname,
+        dispatch_id=dispatch_id,
+        company=company.get("name"),
+    )
+
+    from services.scraper.adapters.consulting_career import ConsultingCareerAdapter, PORTAL_NAME as _CONSULTING_PORTAL
+    adapter = ConsultingCareerAdapter()
+    progress_key = _CONSULTING_PROGRESS_KEY.format(tenant_id=tenant_id or "default")
+
+    async def _run() -> dict:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+            try:
+                raw_jobs = await asyncio.wait_for(
+                    adapter._scrape_company(client, company),
+                    timeout=180,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("consulting_company_timeout", company=company.get("name"))
+                raw_jobs = []
+            except Exception as exc:
+                logger.warning("consulting_company_error", company=company.get("name"), error=str(exc))
+                raw_jobs = []
+
+        # Force the consulting portal tag (the underlying adapter inherits MNC routing).
+        for j in raw_jobs:
+            j.source_portal = _CONSULTING_PORTAL
+
+        if not raw_jobs:
+            await _redis_hincrby(progress_key, "done", 1)
+            return {"company": company.get("name"), "saved": 0, "raw": 0}
+
+        job_data_list = [
+            {
+                "job_title": j.job_title,
+                "company": j.company,
+                "location": j.location,
+                "job_description": j.job_description,
+                "job_url": j.job_url,
+                "posted_date": j.posted_date,
+                "hr_email": j.hr_email,
+                "company_website": j.company_website,
+                "recruiter_name": j.recruiter_name,
+                "source_portal": j.source_portal,
+                "dedupe_hash": j.dedupe_hash,
+                "salary_min": j.salary_min,
+                "salary_max": j.salary_max,
+                "salary_currency": j.salary_currency,
+                "job_type": j.job_type,
+                "experience_required": j.experience_required,
+                "raw_data": j.raw_data,
+            }
+            for j in raw_jobs
+        ]
+
+        saved_job_ids = await _save_jobs_batch(job_data_list, candidate_id)
+        saved_count = len(saved_job_ids)
+
+        if saved_job_ids:
+            from services.ai.tasks import generate_embedding_task, score_job_task
+            bp = BatchPublisher(chunk_size=50)
+            for job_id in saved_job_ids:
+                bp.add(generate_embedding_task.s(job_id))
+                if candidate_id:
+                    bp.add(score_job_task.s(job_id, candidate_id))
+            bp.flush_with_stagger(base_countdown=2, stagger_seconds=0.1)
+
+        await _redis_hincrby(progress_key, "done", 1)
+        if saved_count:
+            await _redis_hincrby(progress_key, "saved", saved_count)
+
+        return {
+            "company": company.get("name"),
+            "saved": saved_count,
+            "raw": len(raw_jobs),
+        }
+
+    try:
+        return _run_async(_run())
+    except SoftTimeLimitExceeded:
+        logger.warning("consulting_company_task_soft_timeout", company=company.get("name"))
+        _run_async(_redis_hincrby(progress_key, "done", 1))
+        return {"company": company.get("name"), "saved": 0, "raw": 0, "timeout": True}
+    except Exception as exc:
+        log_exception(logger, "consulting_company_task_failed", exc, company=company.get("name"))
+        try:
+            _run_async(_redis_hincrby(progress_key, "done", 1))
+        except Exception:
+            pass
+        return {"company": company.get("name"), "saved": 0, "raw": 0, "error": str(exc)}
+
+
+@celery_app.task(
+    name="services.scraper.tasks.consulting_scrape_finalize_task",
+    bind=True,
+    max_retries=0,
+    soft_time_limit=120,
+    time_limit=180,
+    acks_late=True,
+)
+def consulting_scrape_finalize_task(
+    self,
+    results: list[dict],
+    candidate_id: str | None = None,
+    tenant_id: str | None = None,
+    dispatch_id: str | None = None,
+) -> dict:
+    """Aggregate per-company results, release the Redis lock."""
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        task_id=self.request.id,
+        task_name=self.name,
+        worker_id=self.request.hostname,
+        dispatch_id=dispatch_id,
+    )
+
+    total_saved = sum(int(r.get("saved", 0) or 0) for r in (results or []))
+    total_raw = sum(int(r.get("raw", 0) or 0) for r in (results or []))
+    companies = len(results or [])
+    timeouts = sum(1 for r in (results or []) if r.get("timeout"))
+    errors = sum(1 for r in (results or []) if r.get("error"))
+
+    tid = tenant_id or _resolve_default_tenant_id()
+    lock_key = _CONSULTING_LOCK_KEY.format(tenant_id=tid)
+    progress_key = _CONSULTING_PROGRESS_KEY.format(tenant_id=tid)
+
+    async def _finalize() -> None:
+        await _redis_hset(progress_key, {
+            "finished_at": _utcnow().isoformat(),
+            "final_saved": total_saved,
+            "final_raw": total_raw,
+            "final_companies": companies,
+            "final_timeouts": timeouts,
+            "final_errors": errors,
+        }, ttl=600)
+        await _redis_delete(lock_key)
+
+    try:
+        _run_async(_finalize())
+    except Exception as exc:
+        log_exception(logger, "consulting_scrape_finalize_redis_error", exc)
+
+    logger.info(
+        "consulting_scrape_finalize",
+        tenant_id=tid,
+        dispatch_id=dispatch_id,
+        companies=companies,
+        saved=total_saved,
+        raw=total_raw,
+        timeouts=timeouts,
+        errors=errors,
+    )
+    return {
+        "portal": "consulting_direct",
+        "tenant_id": tid,
+        "dispatch_id": dispatch_id,
+        "companies": companies,
+        "saved": total_saved,
+        "raw": total_raw,
+        "timeouts": timeouts,
+        "errors": errors,
+    }
+
+
+@celery_app.task(
+    name="services.scraper.tasks.scrape_consulting_jobs_task",
+    bind=True,
+    max_retries=0,
+    soft_time_limit=60,
+    time_limit=90,
+)
+def scrape_consulting_jobs_task(
+    self,
+    candidate_id: str | None = None,
+    tenant_id: str | None = None,
+    max_companies: int = 1000,
+) -> dict:
+    """Legacy/standalone entry point — kicks off the consulting dispatch task."""
+    res = consulting_scrape_dispatch_task.apply_async(
+        kwargs={
+            "candidate_id": candidate_id,
+            "tenant_id": tenant_id,
+            "max_companies": max_companies,
+        },
+        queue="jh_scraping_consulting_dispatch",
+    )
+    return {"status": "dispatched", "dispatch_task_id": res.id}

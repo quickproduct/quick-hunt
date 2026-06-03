@@ -161,12 +161,20 @@ async def scrape_filter_update(_: Auth, body: ScrapeFilterConfigRequest):
     if not updates:
         raise HTTPException(status_code=400, detail="No settings to update")
 
+    hard_cap = getattr(settings, "max_job_age_days_hard_cap", 90)
+    requested_days = updates.get("max_job_age_days", settings.max_job_age_days)
+    if requested_days < 1 or requested_days > hard_cap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_job_age_days must be between 1 and {hard_cap} (3-month hard cap)",
+        )
+
     config = {
-        "max_job_age_days": updates.get("max_job_age_days", settings.max_job_age_days),
+        "max_job_age_days": requested_days,
         "strict_date_mode": updates.get("strict_date_mode", settings.scrape_strict_date_mode),
     }
 
-    await cache_set("admin:scrape_filter", config, ttl=0)
+    await cache_set("admin:scrape_filter", config, ttl_seconds=None)  # persist indefinitely
 
     logger.info("admin_scrape_filter_updated", **config)
     return {"updated": True, **config}

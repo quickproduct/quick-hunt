@@ -233,7 +233,10 @@ def create_app() -> FastAPI:
         billing,
         blacklist,
         candidates,
+        consulting_companies,
+        hr_emails,
         jobs,
+        mnc_companies,
         search,
         send,
         stats,
@@ -251,12 +254,15 @@ def create_app() -> FastAPI:
     # Core business routers
     app.include_router(candidates.router)
     app.include_router(blacklist.router)
+    app.include_router(mnc_companies.router)
+    app.include_router(consulting_companies.router)
     # send.router must come before jobs.router so that GET /jobs/send_logs
     # is registered before GET /jobs/{job_id} — FastAPI matches in order.
     app.include_router(send.router)
     app.include_router(jobs.router)
     app.include_router(search.router)
     app.include_router(stats.router)
+    app.include_router(hr_emails.router)
     app.include_router(webhooks.router)
 
     # Admin / ops management router

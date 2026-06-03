@@ -20,5 +20,11 @@ ENV PYTHONPATH=/app/backend
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
+# Playwright browsers are pre-installed system-wide in this image at /ms-playwright.
+# Non-root is safe because all browser launches use --no-sandbox.
+RUN groupadd -r appuser && useradd -r -g appuser appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
 # Default: Celery worker (override in docker-compose for beat)
 CMD ["celery", "-A", "services.scraper.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "jh_scraping_bulk,jh_scraping_realtime,jh_scraping_enrichment,jh_cover_letter_bulk,jh_cover_letter_ranking,jh_cover_letter_generation,jh_cover_letter_workflow,jh_email_send"]

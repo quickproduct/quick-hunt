@@ -22,9 +22,9 @@ spec:
           args:
             - postgres
             - -c
-            - max_connections=50
+            - max_connections=200
             - -c
-            - shared_buffers=64MB
+            - shared_buffers=128MB
             - -c
             - checkpoint_completion_target=0.9
             - -c
@@ -61,7 +61,7 @@ spec:
               memory: "256Mi"
               cpu: "150m"
             limits:
-              memory: "512Mi"
+              memory: "1Gi"
               cpu: "500m"
           livenessProbe:
             exec:

@@ -22,16 +22,28 @@ spec:
         app: worker-enrichment
     spec:
       terminationGracePeriodSeconds: 1980
+      initContainers:
+        - name: wait-for-rabbitmq
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z rabbitmq 5672; do echo "waiting for rabbitmq..."; sleep 2; done']
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "10m"
+            limits:
+              memory: "32Mi"
+              cpu: "50m"
       containers:
         - name: worker
           image: k3d-jh-registry:5050/jh-worker-lightweight:local
+          imagePullPolicy: Always
           command:
             - celery
             - -A
             - services.scraper.celery_app
             - worker
             - --loglevel=warning
-            - --concurrency=6
+            - --concurrency=1
             - -Q
             - jh_scraping_enrichment
             - -Ofair
@@ -53,7 +65,7 @@ spec:
               memory: "192Mi"
               cpu: "75m"
             limits:
-              memory: "768Mi"
+              memory: "800Mi"
               cpu: "300m"
 ---
 apiVersion: keda.sh/v1alpha1
@@ -65,9 +77,9 @@ spec:
   scaleTargetRef:
     name: worker-enrichment
   pollingInterval: 10
-  cooldownPeriod: 20
+  cooldownPeriod: 300
   minReplicaCount: 1
-  maxReplicaCount: 8
+  maxReplicaCount: 2
   triggers:
     - type: rabbitmq
       metadata:

@@ -67,13 +67,20 @@ async def cache_get(key: str) -> Any | None:
         return None
 
 
-async def cache_set(key: str, value: Any, ttl_seconds: int = 60) -> None:
-    """Serialise value as JSON and store it with an expiry. Fails silently."""
+async def cache_set(key: str, value: Any, ttl_seconds: int | None = 60) -> None:
+    """Serialise value as JSON and store it with an optional expiry.
+
+    Pass ttl_seconds=None to store without expiry (persists until deleted).
+    Fails silently on any error.
+    """
     try:
         r = await get_redis()
         if r is None:
             return
-        await r.set(key, json.dumps(value), ex=ttl_seconds)
+        if ttl_seconds is None:
+            await r.set(key, json.dumps(value))
+        else:
+            await r.set(key, json.dumps(value), ex=ttl_seconds)
     except Exception as exc:
         logger.debug("cache_set_error", key=key, error=str(exc))
 

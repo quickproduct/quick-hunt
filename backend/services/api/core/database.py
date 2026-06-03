@@ -51,12 +51,12 @@ def get_worker_engine():
     """
     settings = get_settings()
     kwargs: dict = dict(
-        pool_size=3,
-        max_overflow=7,
+        pool_size=2,
+        max_overflow=3,
         pool_timeout=60,
         pool_pre_ping=True,
         echo=False,
-        pool_recycle=-1,
+        pool_recycle=1800,
     )
     if not settings.postgres_local:
         kwargs["connect_args"] = {"server_settings": {"jit": "off"}}

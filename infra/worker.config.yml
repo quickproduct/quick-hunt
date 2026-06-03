@@ -7,50 +7,56 @@ workers:
     broker: rabbitmq
   scraping_realtime:
     scale: 2
-    concurrency: 2
+    concurrency: 4
     queues:
     - jh_scraping_realtime
     broker: rabbitmq
+  scraping_detail:
+    scale: 1
+    concurrency: 6
+    queues:
+    - jh_scraping_detail
+    broker: rabbitmq
   enrichment:
     scale: 1
-    concurrency: 1
+    concurrency: 6
     queues:
     - jh_scraping_enrichment
     broker: rabbitmq
   maintenance:
     scale: 1
-    concurrency: 1
+    concurrency: 4
     queues:
     - jh_jobs_maintenance
     broker: redis
   cover_bulk:
     scale: 1
-    concurrency: 1
+    concurrency: 4
     queues:
     - jh_cover_letter_bulk
     broker: redis
   cover_ranking:
     scale: 1
-    concurrency: 1
+    concurrency: 4
     queues:
     - jh_cover_letter_ranking
     broker: redis
   cover_generation:
     scale: 1
-    concurrency: 1
+    concurrency: 3
     queues:
     - jh_cover_letter_generation
     - jh_embeddings
     broker: redis
   cover_workflow:
     scale: 1
-    concurrency: 1
+    concurrency: 4
     queues:
     - jh_cover_letter_workflow
     broker: redis
   email:
     scale: 1
-    concurrency: 1
+    concurrency: 4
     queues:
     - jh_email_send
     - jh_email_retry
@@ -61,7 +67,18 @@ workers:
     queues:
     - jh_cover_letter_batch
     broker: redis
-    locked: true
+  scraping_mnc_dispatch:
+    scale: 1
+    concurrency: 2
+    queues:
+    - jh_scraping_mnc_dispatch
+    broker: rabbitmq
+  scraping_mnc_company:
+    scale: 0
+    concurrency: 1
+    queues:
+    - jh_scraping_mnc_company
+    broker: rabbitmq
 broker:
   primary: rabbitmq
   pool_limit: 3

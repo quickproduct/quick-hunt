@@ -159,8 +159,21 @@ celery_app.conf.update(
         # ── Scraping (RabbitMQ) ────────────────────────────────────────────────
         "services.scraper.tasks.scheduled_scrape":           {"queue": "jh_scraping_bulk"},
         "services.scraper.tasks.scrape_portal_task":         {"queue": "jh_scraping_realtime"},
+        "services.scraper.tasks.scrape_job_detail_task":     {"queue": "jh_scraping_detail"},
+        # MNC scraping — dispatcher + per-company fan-out + chord finalize
+        "services.scraper.tasks.scrape_mnc_jobs_task":       {"queue": "jh_scraping_mnc_dispatch"},
+        "services.scraper.tasks.mnc_scrape_dispatch_task":   {"queue": "jh_scraping_mnc_dispatch"},
+        "services.scraper.tasks.mnc_scrape_company_task":    {"queue": "jh_scraping_mnc_company"},
+        "services.scraper.tasks.mnc_scrape_finalize_task":   {"queue": "jh_scraping_mnc_dispatch"},
+        # Consulting / IT outsourcing scraping — same pattern as MNC, separate queues
+        "services.scraper.tasks.scrape_consulting_jobs_task":       {"queue": "jh_scraping_consulting_dispatch"},
+        "services.scraper.tasks.consulting_scrape_dispatch_task":   {"queue": "jh_scraping_consulting_dispatch"},
+        "services.scraper.tasks.consulting_scrape_company_task":    {"queue": "jh_scraping_consulting_company"},
+        "services.scraper.tasks.consulting_scrape_finalize_task":   {"queue": "jh_scraping_consulting_dispatch"},
         "services.scraper.tasks.backfill_hr_emails_task":        {"queue": "jh_scraping_enrichment"},
         "services.scraper.tasks.fix_placeholder_emails_task":     {"queue": "jh_scraping_enrichment"},
+        "services.api.tasks.hr_email_tasks.backfill_hr_emails_registry_task": {"queue": "jh_scraping_enrichment"},
+        "services.api.tasks.hr_email_tasks.validate_mx_task":                 {"queue": "jh_scraping_enrichment"},
         # ── Maintenance (Redis) ─────────────────────────────────────────────────
         "services.scraper.tasks.deduplicate_jobs_task":           {"queue": "jh_jobs_maintenance"},
         "services.scraper.tasks.cleanup_old_jobs_task":           {"queue": "jh_jobs_maintenance"},

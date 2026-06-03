@@ -38,9 +38,33 @@ _IMAGE_DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Non-HR local-part prefixes commonly found in job-description boilerplate.
+# These appear as accommodation contacts, press contacts, IT support, etc. —
+# never as actual HR / recruiter inboxes we should apply to.
+_NON_HR_LOCAL_RE = re.compile(
+    r"^("
+    # Accessibility / accommodation (very common in MNC JDs)
+    r"accommodation|accommodations|candidate[_\-]?accessibility|accessibility|"
+    r"disability|disabilities|eeo|equal[_\-]?opportunity|"
+    # Press / PR
+    r"press|media|pr|public[_\-]?relations|communications|"
+    # Operations noise
+    r"import|export|data[_\-]?import|noreply|no[_\-]?reply|donotreply|do[_\-]?not[_\-]?reply|"
+    r"postmaster|mailer[_\-]?daemon|bounce|unsubscribe|newsletter|"
+    # Security / legal
+    r"security|abuse|spam|phishing|vulnerability|legal|compliance|privacy|gdpr|dpo|"
+    # Finance / IT
+    r"billing|finance|accounts|payroll|it|it[_\-]?support|helpdesk|techsupport|"
+    # Generic support (too broad to be a recruiter)
+    r"support|customerservice|customer[_\-]?service|service|servicedesk"
+    r")$",
+    re.IGNORECASE,
+)
+
 
 def _is_junk_email(email: str) -> bool:
-    """Return True if the string looks like an image filename, Sentry ID, etc."""
+    """Return True if the string looks like an image filename, Sentry ID, or
+    a known non-HR boilerplate address (accessibility, press, legal, etc.)."""
     local, domain = email.rsplit("@", 1)
     local_lower = local.lower()
     domain_lower = domain.lower()
@@ -67,6 +91,10 @@ def _is_junk_email(email: str) -> bool:
     # Domain looks like an image/CSS filename — catches retina patterns where
     # the @2x-HASH.ext part becomes the domain after splitting on @
     if _IMAGE_DOMAIN_RE.search(domain_lower):
+        return True
+
+    # Non-HR boilerplate addresses that appear in job-description fine-print
+    if _NON_HR_LOCAL_RE.match(local_lower):
         return True
 
     return False

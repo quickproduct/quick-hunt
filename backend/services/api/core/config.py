@@ -112,10 +112,18 @@ class Settings(BaseSettings):
     linkedin_client_secret: str = ""
 
     # Date freshness filter — jobs with posted_date older than this are skipped
-    # during scraping.  Default 60 days (current month + previous month).
-    max_job_age_days: int = 60
+    # during scraping. Default 30 days ("latest jobs only"); admin overrides are
+    # clamped to max_job_age_days_hard_cap (90 days = 3 months).
+    max_job_age_days: int = 30
+    max_job_age_days_hard_cap: int = 90
     # When True, jobs with no parseable posted_date are also rejected.
-    scrape_strict_date_mode: bool = False
+    # Default True: undated listings are usually stale.
+    scrape_strict_date_mode: bool = True
+
+    # Role filter — when True, jobs whose title/description don't match the
+    # PHP/Python keyword regex (see scraper/role_filter.py) are dropped during
+    # scraping. Applies globally across all adapters.
+    role_filter_enabled: bool = True
 
     # Email test override — when set, all outgoing emails are redirected to this
     # address regardless of the job's HR email. Leave empty for production sends.

@@ -36,13 +36,13 @@ jobs:
           --health-retries 5
 
     env:
-      DATABASE_URL: sqlite+aiosqlite:///:memory:
+      DATABASE_URL: "sqlite+aiosqlite:///:memory:"
       ADMIN_API_KEY: test-api-key
       LLM_PROVIDER: ollama
       VECTOR_DB_PROVIDER: local
       EMAIL_PROVIDER: smtp
-      CELERY_BROKER_URL: memory://
-      CELERY_RESULT_BACKEND: cache+memory://
+      CELERY_BROKER_URL: "memory://"
+      CELERY_RESULT_BACKEND: "cache+memory://"
       PYTHONPATH: backend
 
     steps:

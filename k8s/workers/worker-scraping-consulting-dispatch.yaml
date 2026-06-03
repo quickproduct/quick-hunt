@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-scraping-consulting-dispatch
+  namespace: job-hunter
+  labels:
+    app: worker-scraping-consulting-dispatch
+    worker-type: scraping
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-scraping-consulting-dispatch
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: worker-scraping-consulting-dispatch
+    spec:
+      # Dispatcher + finalize tasks are short; 2 min grace is enough.
+      terminationGracePeriodSeconds: 180
+      initContainers:
+        - name: wait-for-rabbitmq
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z rabbitmq 5672; do echo "waiting for rabbitmq..."; sleep 2; done']
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "10m"
+            limits:
+              memory: "32Mi"
+              cpu: "50m"
+      containers:
+        - name: worker
+          # Lightweight image — no Playwright. Dispatch + finalize don't render pages.
+          image: k3d-jh-registry:5050/jh-worker-lightweight:local
+          imagePullPolicy: Always
+          command:
+            - celery
+            - -A
+            - services.scraper.celery_app
+            - worker
+            - --loglevel=warning
+            - --concurrency=2
+            - -Q
+            - jh_scraping_consulting_dispatch
+            - -Ofair
+            - -E
+            - --without-mingle
+            - --without-gossip
+            - --max-tasks-per-child=200
+            - --hostname=scraping-consulting-dispatch-%(n)s@%h
+          env:
+            - name: SERVICE_NAME
+              value: "worker-scraping-consulting-dispatch"
+          envFrom:
+            - configMapRef:
+                name: job-hunter-config
+            - secretRef:
+                name: job-hunter-secrets
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "300m"
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", "cat /proc/1/cmdline | tr '\\0' ' ' | grep -q celery"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-scraping-consulting-dispatch-scaler
+  namespace: job-hunter
+spec:
+  scaleTargetRef:
+    name: worker-scraping-consulting-dispatch
+  pollingInterval: 10
+  cooldownPeriod: 300
+  minReplicaCount: 0
+  maxReplicaCount: 2
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_scraping_consulting_dispatch
+        mode: QueueLength
+        value: "5"
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq

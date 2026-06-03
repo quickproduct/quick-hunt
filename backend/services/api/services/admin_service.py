@@ -1,5 +1,6 @@
 """Admin service layer — RabbitMQ, Redis feature flags, log reader, worker config."""
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -445,6 +446,29 @@ def apply_performance_mode(mode: str) -> dict[str, Any]:
     if mode not in PERFORMANCE_PRESETS and mode != "normal":
         raise ValueError(f"Unknown mode: {mode}. Valid: ['turbo', 'normal', 'economy']")
 
+    preset = _get_normal_preset() if mode == "normal" else PERFORMANCE_PRESETS[mode]
+
+    # ── Kubernetes path ────────────────────────────────────────────────────────
+    if _is_kubernetes():
+        k8s_results = _apply_k8s_performance_mode(preset)
+        # Still push live concurrency changes to already-running pods
+        concurrency_changes = {
+            w: {"concurrency": {"old": 1, "new": v["concurrency"]}}
+            for w, v in preset.items()
+            if v.get("concurrency", 1) != 1
+        }
+        live_results = _apply_celery_concurrency(concurrency_changes)
+        logger.warning("admin_performance_mode_k8s_applied", mode=mode, k8s_results=k8s_results)
+        return {
+            "mode": mode,
+            "kubernetes": True,
+            "k8s_results": k8s_results,
+            "concurrency_applied_live": any(live_results.values()) if live_results else False,
+            "restart_required": False,
+            "workers_affected": len(k8s_results),
+        }
+
+    # ── Docker Compose path ───────────────────────────────────────────────────
     if not _WORKER_CONFIG_FILE.exists():
         raise FileNotFoundError("worker.config.yml not found")
 
@@ -452,7 +476,6 @@ def apply_performance_mode(mode: str) -> dict[str, Any]:
     with open(_WORKER_CONFIG_FILE, "r") as f:
         cfg = yaml.safe_load(f)
 
-    preset = _get_normal_preset() if mode == "normal" else PERFORMANCE_PRESETS[mode]
     workers = cfg.get("workers", {})
     changes = {}
 
@@ -483,6 +506,7 @@ def apply_performance_mode(mode: str) -> dict[str, Any]:
 
     return {
         "mode": mode,
+        "kubernetes": False,
         "changes": changes,
         "restart_required": scale_changed,
         "concurrency_applied_live": any_live,
@@ -494,17 +518,101 @@ def apply_performance_mode(mode: str) -> dict[str, Any]:
 # Maps worker.config.yml worker key → Celery worker hostname prefix
 # (matches the --hostname flag in docker-compose.yml commands)
 _WORKER_HOSTNAME_PREFIX: dict[str, str] = {
-    "scraping_bulk":     "scraping-bulk",
-    "scraping_realtime": "scraping-rt",
-    "enrichment":        "enrichment",
-    "maintenance":       "maintenance-redis",
-    "cover_bulk":        "cover-bulk-redis",
-    "cover_ranking":     "ranking-redis",
-    "cover_generation":  "generation-redis",
-    "cover_workflow":    "workflow-redis",
-    "email":             "email-redis",
-    "cover_batch":       "cover-batch",
+    "scraping_bulk":          "scraping-bulk",
+    "scraping_realtime":      "scraping-realtime",
+    "enrichment":             "enrichment",
+    "maintenance":            "maintenance",
+    "cover_bulk":             "cover-bulk",
+    "cover_ranking":          "cover-ranking",
+    "cover_generation":       "cover-generation",
+    "cover_workflow":         "cover-workflow",
+    "email":                  "email",
+    "cover_batch":            "cover-batch",
+    "scraping_mnc_dispatch":  "scraping-mnc-dispatch",
+    "scraping_mnc_company":   "scraping-mnc-company",
 }
+
+# ── Kubernetes-native performance mode ────────────────────────────────────────
+
+_WORKER_K8S_DEPLOYMENT: dict[str, str] = {
+    "scraping_bulk":         "worker-scraping-bulk",
+    "scraping_realtime":     "worker-scraping-realtime",
+    "enrichment":            "worker-enrichment",
+    "maintenance":           "worker-maintenance",
+    "cover_bulk":            "worker-cover-bulk",
+    "cover_ranking":         "worker-cover-ranking",
+    "cover_generation":      "worker-cover-generation",
+    "cover_workflow":        "worker-cover-workflow",
+    "email":                 "worker-email",
+    "scraping_mnc_dispatch": "worker-scraping-mnc-dispatch",
+    "scraping_mnc_company":  "worker-scraping-mnc-company",
+    # cover_batch intentionally excluded — fixed 1 replica, no KEDA
+}
+
+# Workers that have KEDA ScaledObjects (cover_batch and maintenance do not)
+_KEDA_MANAGED: frozenset[str] = frozenset({
+    "scraping_bulk", "scraping_realtime", "enrichment",
+    "cover_bulk", "cover_ranking", "cover_generation", "cover_workflow", "email",
+    "scraping_mnc_dispatch", "scraping_mnc_company",
+})
+
+
+def _is_kubernetes() -> bool:
+    return bool(os.environ.get("KUBERNETES_SERVICE_HOST"))
+
+
+def _apply_k8s_performance_mode(
+    preset: dict[str, dict],
+    namespace: str = "job-hunter",
+) -> dict[str, Any]:
+    """Patch KEDA ScaledObjects and scale Deployments for Kubernetes environments.
+
+    For each worker in the preset:
+    1. Patches the KEDA ScaledObject maxReplicaCount so KEDA can scale up to the turbo target.
+    2. Immediately scales the Deployment to min(scale, 2) so pods appear without waiting for the
+       next KEDA poll cycle — KEDA will then grow beyond that as queue depth demands it.
+    """
+    results: dict[str, Any] = {}
+    for worker_name, values in preset.items():
+        deployment = _WORKER_K8S_DEPLOYMENT.get(worker_name)
+        if not deployment:
+            continue
+        scale = values.get("scale", 1)
+        worker_results: dict[str, Any] = {}
+
+        if worker_name in _KEDA_MANAGED:
+            scaler = f"{deployment}-scaler"
+            patch = json.dumps({"spec": {"maxReplicaCount": scale, "minReplicaCount": 1}})
+            try:
+                res = subprocess.run(
+                    ["kubectl", "patch", "scaledobject", scaler,
+                     "-n", namespace, "--type=merge", f"--patch={patch}"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                worker_results["keda_patch"] = res.returncode == 0
+                if res.returncode != 0:
+                    logger.warning("keda_patch_failed", worker=worker_name, stderr=res.stderr[:300])
+            except Exception as exc:
+                worker_results["keda_patch"] = False
+                logger.warning("keda_patch_error", worker=worker_name, error=str(exc))
+
+        # Scale deployment immediately — KEDA will grow/shrink from this baseline
+        immediate_replicas = min(scale, 2)
+        try:
+            res = subprocess.run(
+                ["kubectl", "scale", "deployment", deployment,
+                 f"--replicas={immediate_replicas}", "-n", namespace],
+                capture_output=True, text=True, timeout=15,
+            )
+            worker_results["scale"] = res.returncode == 0
+            if res.returncode != 0:
+                logger.warning("k8s_scale_failed", worker=worker_name, stderr=res.stderr[:300])
+        except Exception as exc:
+            worker_results["scale"] = False
+            logger.warning("k8s_scale_error", worker=worker_name, error=str(exc))
+
+        results[worker_name] = worker_results
+    return results
 
 
 def _apply_celery_concurrency(worker_changes: dict[str, dict]) -> dict[str, bool]:
@@ -636,6 +744,29 @@ async def rollback_config() -> dict[str, Any]:
 
 # ── Performance Mode Detection ────────────────────────────────────────────────
 
+def _build_mode_summary(preset: dict[str, dict]) -> dict[str, Any]:
+    """Return per-worker stats + totals for a given mode preset."""
+    workers: dict[str, Any] = {}
+    total_max_consumers = 0
+    total_pods = 0
+    for name, vals in preset.items():
+        scale = vals.get("scale", 1)
+        concurrency = vals.get("concurrency", 1)
+        max_consumers = scale * concurrency
+        workers[name] = {
+            "max_pods": scale,
+            "concurrency_per_pod": concurrency,
+            "max_consumers": max_consumers,
+        }
+        total_max_consumers += max_consumers
+        total_pods += scale
+    return {
+        "workers": workers,
+        "total_max_pods": total_pods,
+        "total_max_consumers": total_max_consumers,
+    }
+
+
 def get_current_performance_mode() -> dict[str, Any]:
     cfg = get_worker_config()
     if "error" in cfg and "workers" not in cfg:
@@ -647,7 +778,13 @@ def get_current_performance_mode() -> dict[str, Any]:
 
     current: dict[str, dict[str, int]] = {}
     for name, wcfg in workers.items():
-        current[name] = {"scale": wcfg.get("scale", 1), "concurrency": wcfg.get("concurrency", 1)}
+        scale = wcfg.get("scale", 1)
+        concurrency = wcfg.get("concurrency", 1)
+        current[name] = {
+            "scale": scale,
+            "concurrency": concurrency,
+            "max_consumers": scale * concurrency,
+        }
 
     matched_mode = "custom"
     for mode_name, preset in PERFORMANCE_PRESETS.items():
@@ -680,10 +817,14 @@ def get_current_performance_mode() -> dict[str, Any]:
     except Exception:
         mtime = None
 
+    all_presets = {**PERFORMANCE_PRESETS, "normal": _get_normal_preset()}
+    mode_comparison = {name: _build_mode_summary(preset) for name, preset in all_presets.items()}
+
     return {
         "mode": matched_mode,
         "applied_at": mtime,
         "workers": current,
+        "mode_comparison": mode_comparison,
     }
 
 
@@ -814,16 +955,18 @@ async def get_workers_live_status() -> dict[str, Any]:
 
 
 _WORKER_DOCKER_MAP: dict[str, str] = {
-    "scraping_bulk": "worker-scraping-bulk",
-    "scraping_realtime": "worker-scraping-realtime",
-    "enrichment": "worker-enrichment",
-    "maintenance": "worker-maintenance",
-    "cover_bulk": "worker-cover-bulk",
-    "cover_ranking": "worker-cover-ranking",
-    "cover_generation": "worker-cover-generation",
-    "cover_workflow": "worker-cover-workflow",
-    "email": "worker-email",
-    "cover_batch": "worker-cover-batch",
+    "scraping_bulk":         "worker-scraping-bulk",
+    "scraping_realtime":     "worker-scraping-realtime",
+    "enrichment":            "worker-enrichment",
+    "maintenance":           "worker-maintenance",
+    "cover_bulk":            "worker-cover-bulk",
+    "cover_ranking":         "worker-cover-ranking",
+    "cover_generation":      "worker-cover-generation",
+    "cover_workflow":        "worker-cover-workflow",
+    "email":                 "worker-email",
+    "cover_batch":           "worker-cover-batch",
+    "scraping_mnc_dispatch": "worker-scraping-mnc-dispatch",
+    "scraping_mnc_company":  "worker-scraping-mnc-company",
 }
 
 

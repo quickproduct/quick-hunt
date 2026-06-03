@@ -3,6 +3,10 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
+import structlog
+
+logger = structlog.get_logger(__name__)
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -151,7 +155,8 @@ async def direct_hr_send(
     if candidate.resume_url:
         try:
             attachment_bytes = fetch_resume(candidate.resume_url)
-        except Exception:
+        except Exception as exc:
+            logger.warning("resume_fetch_failed_direct_send", error=str(exc))
             attachment_bytes = None
 
     safe_name = candidate.name.lower().replace(" ", "-")

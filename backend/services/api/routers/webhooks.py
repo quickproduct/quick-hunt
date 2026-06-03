@@ -243,6 +243,29 @@ async def _process_brevo_event(event: dict[str, Any], db: AsyncSession) -> None:
             )
         )
 
+    # Sync delivery/bounce outcome to hr_emails registry
+    _BOUNCE_TYPE_MAP = {
+        "hard_bounce": "hard",
+        "invalid_email": "hard",
+        "soft_bounce": "soft",
+        "blocked": "blocked",
+        "spam": "spam",
+    }
+    _bounce_type = _BOUNCE_TYPE_MAP.get(event_type)
+    _bounce_reason = event.get("reason") if _bounce_type in ("hard", "blocked") else None
+
+    from services.api.models.hr_email_utils import upsert_hr_email
+    await upsert_hr_email(
+        session=db,
+        tenant_id=log.tenant_id,
+        email=log.to_email,
+        increment_delivered=(event_type == "delivered"),
+        increment_opened=(event_type in ("opened", "first_opening")),
+        increment_clicked=(event_type == "click"),
+        bounce_type=_bounce_type,
+        bounce_reason=_bounce_reason,
+    )
+
     await db.commit()
     logger.info(
         "brevo_webhook_processed",
