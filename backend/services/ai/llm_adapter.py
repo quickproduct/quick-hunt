@@ -181,8 +181,14 @@ class OllamaEmbeddingAdapter:
     Includes retry with exponential back-off for transient connection errors.
     """
 
-    _MAX_RETRIES = 3
-    _RETRY_DELAYS = (1, 3, 6)  # seconds
+    # Retry budget is sized to absorb an Ollama cold start: when Ollama is
+    # KEDA-scaled to zero (see k8s/infrastructure/ollama.yaml), the first
+    # embedding after idle must wait for pod scheduling + model load (~20–35 s).
+    # Total wait ≈ 2+5+10+20 = 37 s before giving up. Embeddings are best-effort
+    # and run on their own (concurrency=1) queue, so this never blocks the user
+    # path or the scoring/cover pipeline.
+    _MAX_RETRIES = 5
+    _RETRY_DELAYS = (2, 5, 10, 20)  # seconds (len == _MAX_RETRIES - 1)
 
     def __init__(self) -> None:
         import httpx

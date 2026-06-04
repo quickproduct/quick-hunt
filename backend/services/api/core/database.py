@@ -32,6 +32,10 @@ def get_engine():
         kwargs["connect_args"] = {"server_settings": {"jit": "off", "statement_timeout": "60000"}}
     else:
         kwargs["connect_args"] = {"server_settings": {"statement_timeout": "60000"}}
+    if settings.db_pgbouncer:
+        # PgBouncer transaction pooling: disable asyncpg server-side prepared
+        # statement caching (see Settings.db_pgbouncer).
+        kwargs["connect_args"]["statement_cache_size"] = 0
     return create_async_engine(settings.database_url, **kwargs)
 
 
@@ -60,6 +64,9 @@ def get_worker_engine():
     )
     if not settings.postgres_local:
         kwargs["connect_args"] = {"server_settings": {"jit": "off"}}
+    if settings.db_pgbouncer:
+        # PgBouncer transaction pooling: disable asyncpg prepared-statement cache.
+        kwargs.setdefault("connect_args", {})["statement_cache_size"] = 0
     return create_async_engine(settings.database_url, **kwargs)
 
 

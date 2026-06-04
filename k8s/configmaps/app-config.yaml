@@ -9,6 +9,11 @@ data:
   LOG_LEVEL: "WARNING"
   LOG_TO_FILE: "false"
   OTEL_SDK_DISABLED: "true"
+  # Cap glibc malloc arenas. Default is 8 × CPU cores, which fragments heap memory
+  # in multi-threaded Python workers (esp. the lxml/bs4 parsing in scraping +
+  # enrichment) and inflates RSS that is never returned to the OS. 2 arenas keeps
+  # RSS close to live-set size at negligible allocation-contention cost.
+  MALLOC_ARENA_MAX: "2"
 
   # --- Database ---
   POSTGRES_DB: "jobhunter"
@@ -30,13 +35,18 @@ data:
   # --- LLM ---
   LLM_PROVIDER: "groq"
   GROQ_MODEL: "llama-3.3-70b-versatile"
+  # Smaller/faster model for high-volume job scoring (reserves 70B + token
+  # budget for cover letters). Empty = reuse GROQ_MODEL.
+  GROQ_SCORING_MODEL: "llama-3.1-8b-instant"
   GROQ_RPM: "10"
   GROQ_TPM: "12000"
 
   # --- Embeddings ---
   OLLAMA_HOST: "http://ollama:11434"
   OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
-  VECTOR_DB_PROVIDER: "local"
+  # pgvector: durable, process-safe, HNSW-indexed (migration 0011). "local" is
+  # a JSON-file dev-only backend that is unsafe across worker processes.
+  VECTOR_DB_PROVIDER: "pgvector"
 
   # --- Storage ---
   S3_ENDPOINT_URL: "https://8c0ae864a440df58cc578994a1e37d71.r2.cloudflarestorage.com"

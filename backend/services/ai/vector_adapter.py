@@ -110,24 +110,23 @@ class PgVectorAdapter(BaseVectorAdapter):
     async def query(self, vector: list[float], top_k: int = 10) -> list[dict]:
         """Return top-k most similar embeddings using the native <=> operator.
 
-        Falls back to Python cosine similarity when no rows have embedding_vector
-        populated yet (i.e. the migration ran but no embeddings have been generated).
+        The native HNSW path is attempted first in a SINGLE round-trip (no
+        preliminary COUNT(*)): the WHERE embedding_vector IS NOT NULL clause means
+        an empty result implies no native vectors exist yet. Only then do we fall
+        back to Python cosine similarity over embedding_json. A SQL error (e.g. the
+        embedding_vector column missing because migration 0011 hasn't run) also
+        triggers the fallback so the adapter degrades gracefully.
         """
         from sqlalchemy import text
+        from sqlalchemy.exc import SQLAlchemyError
 
         from services.api.core.database import get_worker_session_factory
 
         vec_str = self._vec_literal(vector)
         sf = get_worker_session_factory()
         async with sf() as session:
-            # Check if any rows have the native vector column populated
-            count_result = await session.execute(
-                text("SELECT COUNT(*) FROM embeddings WHERE embedding_vector IS NOT NULL")
-            )
-            native_count = count_result.scalar() or 0
-
-            if native_count > 0:
-                # Native ANN search via HNSW index — O(log n), not O(n)
+            try:
+                # Native ANN search via HNSW index — O(log n), not O(n).
                 # Use CAST(:vec AS vector) instead of :vec::vector because
                 # SQLAlchemy's text() treats :name as a named parameter and
                 # the double-colon causes asyncpg to fail with a syntax error.
@@ -142,15 +141,22 @@ class PgVectorAdapter(BaseVectorAdapter):
                     ),
                     {"vec": vec_str, "k": top_k},
                 )
-                return [{"id": row.id, "job_id": row.job_id, "score": row.score} for row in result]
-            else:
-                # No native vectors yet — fall back to Python cosine similarity
-                # on embedding_json until embeddings are regenerated.
-                from sqlalchemy import select
-                from services.api.models.db import Embedding
+                rows = [{"id": row.id, "job_id": row.job_id, "score": row.score} for row in result]
+                if rows:
+                    return rows
+            except SQLAlchemyError as exc:
+                # Column/index not present (migration not run) — degrade to Python path.
+                await session.rollback()
+                logger.warning("pgvector_native_query_failed_fallback", error=str(exc)[:200])
 
-                result = await session.execute(select(Embedding))
-                embeddings = result.scalars().all()
+            # No native vectors yet (or native path unavailable) — fall back to
+            # Python cosine similarity on embedding_json until embeddings are
+            # (re)generated into the native column.
+            from sqlalchemy import select
+            from services.api.models.db import Embedding
+
+            result = await session.execute(select(Embedding))
+            embeddings = result.scalars().all()
 
         scored = []
         for emb in embeddings:

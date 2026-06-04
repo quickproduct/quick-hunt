@@ -50,7 +50,11 @@ spec:
             - -E
             - --without-mingle
             - --without-gossip
-            - --max-tasks-per-child=200
+            # Recycle the process more aggressively. HR-email discovery parses many
+            # pages with lxml/bs4; lxml frees memory to glibc, which does not return
+            # it to the OS, so RSS climbs to ~800Mi over a few hundred tasks. A lower
+            # ceiling caps that growth (paired with MALLOC_ARENA_MAX in the configmap).
+            - --max-tasks-per-child=50
             - --hostname=enrichment-%(n)s@%h
           env:
             - name: SERVICE_NAME

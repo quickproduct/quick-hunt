@@ -1,0 +1,119 @@
+# PgBouncer — connection pooler in TRANSACTION mode.
+#
+# WHY: each Celery worker is a separate OS process with its own asyncpg pool, and
+# @cron_safe spawns a fresh thread+engine per task. database.py notes this can reach
+# ~840 backend connections worst-case against Postgres max_connections=400. PgBouncer
+# multiplexes many short-lived client connections onto a few server connections, so
+# the worker count is decoupled from Postgres backend processes (each of which costs
+# real RAM). Footprint of PgBouncer itself: ~10–20 Mi.
+#
+# CUTOVER (not automatic — this manifest only adds the pooler):
+#   1. kubectl apply -f k8s/infrastructure/pgbouncer.yaml
+#   2. Point the app at it: in k8s/configmaps/app-config.yaml set
+#        DATABASE_URL: postgresql+asyncpg://jobhunter:jobhunter@pgbouncer:6432/jobhunter
+#        DB_PGBOUNCER: "true"     # disables asyncpg server-side prepared statements
+#   3. Roll the API + workers. Verify pg_stat_activity backend count stays flat as
+#      workers scale (mcp get_db_health).
+#
+# NOTE: alembic migrations should keep talking to Postgres DIRECTLY (DDL + the
+# CREATE EXTENSION/HNSW statements in migration 0011 are happiest on a session
+# connection), so run the migrations job against postgres:5432, not pgbouncer.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgbouncer-config
+  namespace: job-hunter
+data:
+  pgbouncer.ini: |
+    [databases]
+    jobhunter = host=postgres port=5432 dbname=jobhunter
+
+    [pgbouncer]
+    listen_addr = 0.0.0.0
+    listen_port = 6432
+    auth_type = scram-sha-256
+    auth_file = /etc/pgbouncer/userlist.txt
+    # Transaction pooling: a server connection is returned to the pool at the end
+    # of every transaction — the right mode for many short-lived worker queries.
+    pool_mode = transaction
+    max_client_conn = 1000
+    default_pool_size = 25
+    min_pool_size = 5
+    reserve_pool_size = 5
+    reserve_pool_timeout = 3
+    server_idle_timeout = 60
+    # asyncpg names prepared statements; ignore the SET/RESET it issues so they
+    # don't pin a server connection in transaction mode.
+    ignore_startup_parameters = extra_float_digits,options
+    log_connections = 0
+    log_disconnections = 0
+  # Dev/local credentials match k8s/infrastructure/postgres.yaml (jobhunter/jobhunter).
+  # For a real deployment, generate this from the DB password's SCRAM verifier and
+  # mount it from job-hunter-secrets instead of a ConfigMap.
+  userlist.txt: |
+    "jobhunter" "jobhunter"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbouncer
+  namespace: job-hunter
+  labels:
+    app: pgbouncer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgbouncer
+  template:
+    metadata:
+      labels:
+        app: pgbouncer
+    spec:
+      containers:
+        - name: pgbouncer
+          image: edoburu/pgbouncer:v1.23.1-p2
+          ports:
+            - containerPort: 6432
+          # edoburu/pgbouncer uses the mounted pgbouncer.ini when present.
+          env:
+            - name: AUTH_TYPE
+              value: "scram-sha-256"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pgbouncer
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "20m"
+            limits:
+              memory: "64Mi"
+              cpu: "200m"
+          readinessProbe:
+            tcpSocket:
+              port: 6432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 6432
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: pgbouncer-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgbouncer
+  namespace: job-hunter
+  labels:
+    app: pgbouncer
+spec:
+  selector:
+    app: pgbouncer
+  ports:
+    - port: 6432
+      targetPort: 6432

@@ -174,7 +174,13 @@ async def score_job_relevance(
         if not slot_ok:
             logger.warning("scoring_rate_limit_timeout", job_title=job_title)
 
-        llm = get_structured_llm(JobRelevanceScore, max_tokens=200, callbacks=_callbacks)
+        # Use the dedicated (smaller/faster) scoring model when configured, so the
+        # 70B model and Groq token budget stay reserved for cover-letter generation.
+        from services.api.core.config import get_settings
+        scoring_model = get_settings().groq_scoring_model or None
+        llm = get_structured_llm(
+            JobRelevanceScore, max_tokens=200, callbacks=_callbacks, model=scoring_model
+        )
         result: JobRelevanceScore = await llm.ainvoke(prompt)
         logger.info(
             "job_scored",

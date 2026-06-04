@@ -85,6 +85,53 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
 
+  # Run the real Alembic migrations against Postgres+pgvector. The unit/integration
+  # tests above run on SQLite, so the raw-SQL pgvector paths (CREATE EXTENSION,
+  # vector(768) column, HNSW index in migration 0011) are otherwise never exercised
+  # in CI. This job catches migration/SQL drift before it reaches a deploy.
+  migrations:
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: jobhunter
+          POSTGRES_PASSWORD: jobhunter
+          POSTGRES_DB: jobhunter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: "postgresql+asyncpg://jobhunter:jobhunter@localhost:5432/jobhunter"
+      PYTHONPATH: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install migration dependencies
+        run: pip install -r backend/requirements-shared.txt
+
+      - name: alembic upgrade head (Postgres + pgvector)
+        run: alembic -c backend/alembic.ini upgrade head
+
+      - name: alembic downgrade base then upgrade head (round-trip)
+        run: |
+          alembic -c backend/alembic.ini downgrade base
+          alembic -c backend/alembic.ini upgrade head
+
   docker-build:
     runs-on: ubuntu-latest
     needs: test
@@ -101,8 +148,20 @@ jobs:
           context: .
           file: infra/Dockerfile.api
           push: false
+          load: true          # load into the local daemon so Trivy can scan it
+          tags: jh-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Scan API image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: jh-api:ci
+          format: table
+          exit-code: "1"            # fail the build on findings at the severities below
+          ignore-unfixed: true      # don't fail on vulns with no upstream fix yet
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
 
       - name: Build worker image
         uses: docker/build-push-action@v5

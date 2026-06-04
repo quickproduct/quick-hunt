@@ -76,9 +76,12 @@ metadata:
 spec:
   scaleTargetRef:
     name: worker-maintenance
-  pollingInterval: 15  # Low urgency — check every minute
+  pollingInterval: 15  # Low urgency — check every 15s
   cooldownPeriod: 300
-  minReplicaCount: 1
+  # Idle between beat ticks (dedup/health/reaper run every 10–15 min). Scale to
+  # zero when the queue is empty; KEDA activates 0→1 on the first queued message,
+  # so a beat task waits at most ~pollingInterval + pod-start before it runs.
+  minReplicaCount: 0
   maxReplicaCount: 1   # Maintenance tasks should not fan out aggressively
   triggers:
     - type: rabbitmq
