@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     # POSTGRES_LOCAL=false enables Neon-specific tuning (pool_recycle, JIT off, keep-alive pings).
     database_url: str = "postgresql+asyncpg://jobhunter:jobhunter@postgres:5432/jobhunter"
     postgres_local: bool = True
+    # Set true when DATABASE_URL points at PgBouncer in *transaction* pooling mode.
+    # asyncpg uses server-side prepared statements by default, which break under
+    # transaction pooling (a statement prepared on one server connection may be
+    # executed on another). statement_cache_size=0 disables them. See
+    # k8s/infrastructure/pgbouncer.yaml. Leave false for direct Postgres.
+    db_pgbouncer: bool = False
 
     # Redis — local Docker by default (result backend + API cache).
     # For cloud (Upstash): use rediss:// URL with TLS.
@@ -58,6 +64,11 @@ class Settings(BaseSettings):
     # Groq
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"   # or mixtral-8x7b-32768, gemma2-9b-it
+    # Dedicated (usually smaller/faster) model for job *scoring*. Scoring is a
+    # high-volume, low-nuance task — running it on llama-3.1-8b-instant frees the
+    # 70B model and the Groq token budget for cover-letter generation, cutting
+    # scoring latency ~3–5×. Empty = reuse groq_model (no behavior change).
+    groq_scoring_model: str = "llama-3.1-8b-instant"
     # Groq rate limiting — shared across all workers via Redis sliding window
     groq_rpm: int = 10          # requests per minute (free tier = 10 RPM for 70B model)
     groq_tpm: int = 12000       # tokens per minute (informational; not enforced yet)
@@ -71,7 +82,10 @@ class Settings(BaseSettings):
     ollama_embedding_model: str = "nomic-embed-text"
 
     # Vector DB
-    vector_db_provider: Literal["pgvector", "pinecone", "local"] = "local"
+    # Default to pgvector: durable, process-safe, HNSW-indexed ANN (migration 0011).
+    # "local" is a JSON-file dev/test backend only — it rewrites the whole file per
+    # upsert and is NOT safe across the many separate worker processes.
+    vector_db_provider: Literal["pgvector", "pinecone", "local"] = "pgvector"
     pinecone_api_key: str = ""
     pinecone_env: str = "us-east-1-aws"
     pinecone_index: str = "job-embeddings"

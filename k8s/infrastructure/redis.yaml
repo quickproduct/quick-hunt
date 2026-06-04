@@ -22,9 +22,16 @@ spec:
           command:
             - redis-server
             - --maxmemory
-            - "200mb"
+            - "512mb"            # more headroom (pod limit is 1Gi) → eviction rarely triggers
+            # volatile-lru, NOT allkeys-lru: this single Redis is shared by the cache,
+            # Celery result backend, the Groq rate-limiter, cron locks, AND persistent
+            # control-plane keys (admin:portal:*:enabled, feature flags) that have NO TTL.
+            # Under allkeys-lru, cache pressure could evict those config keys and silently
+            # re-enable portals/features. volatile-lru only evicts keys that carry a TTL
+            # (all cache + result entries do), so the no-TTL control-plane keys are safe.
+            # Next step if eviction pressure returns: split cache onto a separate Redis.
             - --maxmemory-policy
-            - allkeys-lru
+            - volatile-lru
             - --save
             - ""       # disable AOF/RDB persistence — result backend data is ephemeral
           ports:

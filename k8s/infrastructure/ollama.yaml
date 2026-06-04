@@ -92,3 +92,31 @@ spec:
   ports:
     - port: 11434
       targetPort: 11434
+---
+# Scale Ollama to zero when idle — it is ONLY used by embedding generation
+# (job scoring + cover letters use Groq), so nothing else needs it warm.
+# Reclaims ~0.5–1 Gi on the shared 8 GB node. KEDA activates 0→1 on the first
+# message in jh_embeddings; the embedding adapter's retry window (see
+# llm_adapter.OllamaEmbeddingAdapter) is sized to tolerate the cold start.
+# Long cooldown keeps it warm through a whole embedding batch.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ollama-scaler
+  namespace: job-hunter
+spec:
+  scaleTargetRef:
+    name: ollama
+  pollingInterval: 10
+  cooldownPeriod: 600   # stay warm 10 min after the queue drains
+  minReplicaCount: 0
+  maxReplicaCount: 1     # single instance — PVC is ReadWriteOnce
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_embeddings
+        mode: QueueLength
+        value: "1"
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq

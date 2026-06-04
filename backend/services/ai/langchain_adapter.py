@@ -24,19 +24,25 @@ from pydantic import BaseModel
 from services.api.core.config import get_settings
 
 
-def get_langchain_llm(max_tokens: int = 500, callbacks: list[Any] | None = None):
+def get_langchain_llm(
+    max_tokens: int = 500,
+    callbacks: list[Any] | None = None,
+    model: str | None = None,
+):
     """Return a ChatGroq instance wired to the configured Groq model.
 
     Args:
         max_tokens: Maximum tokens to generate.
         callbacks:  Optional LangChain callbacks (e.g. LangfuseCallbackHandler).
+        model:      Optional model override (e.g. a smaller/faster scoring model).
+                    Defaults to settings.groq_model.
     """
     from langchain_groq import ChatGroq
 
     settings = get_settings()
     return ChatGroq(
         api_key=settings.groq_api_key,
-        model=settings.groq_model,
+        model=model or settings.groq_model,
         max_tokens=max_tokens,
         temperature=0.3,
         request_timeout=30,
@@ -54,6 +60,7 @@ def get_structured_llm(
     output_schema: type[BaseModel],
     max_tokens: int = 500,
     callbacks: list[Any] | None = None,
+    model: str | None = None,
 ):
     """Return a ChatGroq LLM bound to produce structured output matching output_schema.
 
@@ -61,7 +68,8 @@ def get_structured_llm(
         output_schema: Pydantic model class for structured output.
         max_tokens:    Maximum tokens to generate.
         callbacks:     Optional LangChain callbacks for observability.
+        model:         Optional model override (defaults to settings.groq_model).
     """
-    return get_langchain_llm(max_tokens=max_tokens, callbacks=callbacks).with_structured_output(
-        output_schema
-    )
+    return get_langchain_llm(
+        max_tokens=max_tokens, callbacks=callbacks, model=model
+    ).with_structured_output(output_schema)
