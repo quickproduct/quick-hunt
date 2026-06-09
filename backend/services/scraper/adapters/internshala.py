@@ -16,6 +16,8 @@ class InternshalaAdapter(BaseAdapter):
     PORTAL_NAME = "internshala"
     REQUESTS_PER_MINUTE = 8
     CONCURRENT_BROWSERS = 1
+    # Internshala is a React SPA — detail content only exists after JS runs.
+    DETAIL_HTTP_FIRST = False
 
     BASE_URL = "https://internshala.com"
 

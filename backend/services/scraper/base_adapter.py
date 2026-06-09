@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import random
 import re
+import threading
 import urllib.robotparser
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -76,6 +77,69 @@ _BLOCKED_HOST_FRAGMENTS = (
     "scorecardresearch.com",
     "quantserve.com",
 )
+
+# ------------------------------------------------------------------ #
+# Process-lifetime browser singleton (per worker thread)               #
+# ------------------------------------------------------------------ #
+# Detail tasks used to launch a fresh Playwright + Chromium per page —
+# a ~2-4s cold start and a large RSS spike for every single job detail.
+# Instead we keep one Chromium per worker thread, bound to the persistent
+# event loop from services.common.async_utils. Lifecycle is bounded by
+# Celery's --max-tasks-per-child; cleanup is best-effort on shutdown
+# (Chromium dies with the worker process either way).
+_browser_local = threading.local()
+
+
+async def _get_persistent_browser():
+    """Return this thread's long-lived Chromium, launching it on first use."""
+    loop = asyncio.get_running_loop()
+    state = getattr(_browser_local, "state", None)
+    if state is not None:
+        pw, browser, bound_loop = state
+        if bound_loop is loop and browser.is_connected():
+            return browser
+        # Loop was recreated or the browser died — discard the stale handle.
+        if bound_loop is loop:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        _browser_local.state = None
+
+    from playwright.async_api import async_playwright  # lazy import
+
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    _browser_local.state = (pw, browser, loop)
+    logger.info("persistent_browser_launched")
+    return browser
+
+
+def _close_persistent_browser(**kwargs) -> None:
+    """Best-effort browser cleanup on worker shutdown (Celery signal)."""
+    state = getattr(_browser_local, "state", None)
+    if state is None:
+        return
+    pw, browser, bound_loop = state
+    _browser_local.state = None
+    try:
+        if not bound_loop.is_closed():
+            bound_loop.run_until_complete(browser.close())
+            bound_loop.run_until_complete(pw.stop())
+    except Exception:
+        pass
+
+
+try:
+    from celery.signals import worker_process_shutdown as _wps
+    _wps.connect(_close_persistent_browser)
+except Exception:
+    pass
+
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE)
 SKIP_DOMAINS = {
@@ -269,6 +333,15 @@ class BaseAdapter(ABC):
     # Asset types aborted via route interception. Override per adapter if a
     # portal genuinely needs one of these to render job content.
     BLOCKED_RESOURCE_TYPES: frozenset = frozenset({"image", "media", "font", "stylesheet"})
+    # Detail pages: try a plain HTTP GET before falling back to a browser.
+    # Set False on adapters whose detail pages are JS-only (Indeed, Internshala,
+    # MNC career pages behind Workday/iCIMS/etc.).
+    DETAIL_HTTP_FIRST: bool = True
+    # Optional substring that must appear in HTTP-fetched HTML for it to count
+    # as a real detail page (guards against bot walls / empty shells).
+    DETAIL_CONTENT_MARKER: Optional[str] = None
+    # HTTP responses smaller than this are treated as bot walls / redirector stubs.
+    _MIN_DETAIL_HTML_BYTES = 2048
 
     def __init__(self) -> None:
         self._request_times: list[float] = []
@@ -453,17 +526,46 @@ class BaseAdapter(ABC):
                 if not page.is_closed():
                     await page.close()
 
-        # Fallback: create a fresh browser for single-page fetches (e.g. parse_job_detail)
-        from playwright.async_api import async_playwright  # lazy import
+        # No shared context — single-page fetch (e.g. parse_job_detail).
+        # Most detail pages are server-rendered, so try plain HTTP first and
+        # only fall back to the (thread-persistent) browser when it fails.
+        if self.DETAIL_HTTP_FIRST:
+            html = await self._get_page_html_http(url)
+            if html is not None:
+                logger.info("detail_fetch_via", via="http", portal=self.PORTAL_NAME, url=url)
+                return html
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
-            ctx = await self._new_context(browser)
-            page = await ctx.new_page()
-            try:
-                html = await self._navigate_with_retry(page, url, wait_selector)
-            finally:
-                await browser.close()
+        browser = await _get_persistent_browser()
+        ctx = await self._new_context(browser)
+        page = await ctx.new_page()
+        try:
+            html = await self._navigate_with_retry(page, url, wait_selector)
+            logger.info("detail_fetch_via", via="browser", portal=self.PORTAL_NAME, url=url)
+            return html
+        finally:
+            await ctx.close()
+
+    async def _get_page_html_http(self, url: str) -> Optional[str]:
+        """Fetch a detail page with plain HTTP. Returns None when the response
+        doesn't look like a usable detail page (caller falls back to browser)."""
+        headers = {
+            "User-Agent": _CONTEXT_KWARGS["user_agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
+                resp = await client.get(url)
+        except Exception as exc:
+            logger.debug("detail_http_fetch_error", url=url, error=str(exc)[:200])
+            return None
+        if resp.status_code != 200:
+            return None
+        html = resp.text
+        if len(html) < self._MIN_DETAIL_HTML_BYTES:
+            return None
+        if self.DETAIL_CONTENT_MARKER and self.DETAIL_CONTENT_MARKER not in html:
+            return None
         return html
 
     # ------------------------------------------------------------------ #

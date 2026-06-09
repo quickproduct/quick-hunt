@@ -37,7 +37,7 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 512Mi
+            sizeLimit: 256Mi
       containers:
         - name: worker
           image: k3d-jh-registry:5050/jh-worker-playwright:local
@@ -74,8 +74,12 @@ spec:
               memory: "512Mi"
               cpu: "150m"
             limits:
-              memory: "1280Mi"
-              cpu: "800m"
+              # Limit must also cover the 256Mi /dev/shm emptyDir above.
+              # Detail tasks are HTTP-first with a thread-persistent browser
+              # fallback and asset blocking, so the old per-page Chromium
+              # launches (which OOMKilled this pod at 1280Mi) are gone.
+              memory: "1Gi"
+              cpu: "500m"
           livenessProbe:
             exec:
               command: ["bash", "-c", "pgrep -f 'celery.*worker' > /dev/null"]

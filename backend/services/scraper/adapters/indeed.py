@@ -16,6 +16,9 @@ class IndeedAdapter(BaseAdapter):
     PORTAL_NAME = "indeed"
     REQUESTS_PER_MINUTE = 6
     CONCURRENT_BROWSERS = 1
+    # Indeed detail pages are JS-rendered and bot-walled — plain HTTP returns
+    # a challenge page, so skip straight to the browser.
+    DETAIL_HTTP_FIRST = False
 
     BASE_URL = "https://in.indeed.com"
 
