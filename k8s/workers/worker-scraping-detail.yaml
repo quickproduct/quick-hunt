@@ -98,7 +98,7 @@ spec:
     name: worker-scraping-detail
   pollingInterval: 5
   cooldownPeriod: 300
-  minReplicaCount: 1
+  minReplicaCount: 0
   maxReplicaCount: 1
   triggers:
     - type: rabbitmq
