@@ -18,6 +18,65 @@ from services.api.core.config import get_settings
 
 logger = structlog.get_logger(__name__)
 
+# Chromium launch args shared by every browser launch (container-optimized,
+# minimal background work, capped JS heap).
+_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-setuid-sandbox",
+    "--no-zygote",
+    "--single-process",
+    "--disable-software-rasterizer",
+    "--blink-settings=imagesEnabled=false",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--mute-audio",
+    "--no-first-run",
+    "--metrics-recording-only",
+    "--js-flags=--max-old-space-size=256",
+]
+
+# Context options shared by every browser context.
+_CONTEXT_KWARGS = {
+    "user_agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "viewport": {"width": 1280, "height": 720},
+    "locale": "en-US",
+    "timezone_id": "Asia/Kolkata",
+}
+
+# Third-party analytics/ads hosts that never contribute job content.
+_BLOCKED_HOST_FRAGMENTS = (
+    "googletagmanager.com",
+    "google-analytics.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "adsystem.com",
+    "connect.facebook.net",
+    "facebook.com/tr",
+    "hotjar.com",
+    "segment.com",
+    "segment.io",
+    "newrelic.com",
+    "nr-data.net",
+    "sentry-cdn.com",
+    "fullstory.com",
+    "clarity.ms",
+    "mixpanel.com",
+    "amplitude.com",
+    "criteo.com",
+    "scorecardresearch.com",
+    "quantserve.com",
+)
+
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE)
 SKIP_DOMAINS = {
     "example.com", "noreply.com", "naukri.com", "indeed.com", "in.indeed.com",
@@ -207,6 +266,9 @@ class BaseAdapter(ABC):
     PORTAL_NAME: str = "base"
     REQUESTS_PER_MINUTE: int = 10
     CONCURRENT_BROWSERS: int = 1
+    # Asset types aborted via route interception. Override per adapter if a
+    # portal genuinely needs one of these to render job content.
+    BLOCKED_RESOURCE_TYPES: frozenset = frozenset({"image", "media", "font", "stylesheet"})
 
     def __init__(self) -> None:
         self._request_times: list[float] = []
@@ -267,6 +329,30 @@ class BaseAdapter(ABC):
     # ------------------------------------------------------------------ #
     # Playwright browser session — reuse across multiple page fetches     #
     # ------------------------------------------------------------------ #
+    async def _route_blocker(self, route) -> None:
+        """Abort requests for heavy assets and third-party analytics.
+
+        Job content lives in the DOM regardless of CSS/images, so blocking
+        these cuts most of the page's bytes and Chromium's layout/paint CPU.
+        Adapters that need an asset type can shrink BLOCKED_RESOURCE_TYPES.
+        """
+        request = route.request
+        if request.resource_type in self.BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+            return
+        url = request.url
+        if any(host in url for host in _BLOCKED_HOST_FRAGMENTS):
+            await route.abort()
+            return
+        await route.continue_()
+
+    async def _new_context(self, browser):
+        """Create a browser context with shared options + asset blocking."""
+        proxy = {"server": self._settings.proxy_url} if self._settings.proxy_url else None
+        ctx = await browser.new_context(**_CONTEXT_KWARGS, proxy=proxy)
+        await ctx.route("**/*", self._route_blocker)
+        return ctx
+
     @asynccontextmanager
     async def _browser_session(self):
         """Create a shared browser context for the duration of a scraping session.
@@ -276,32 +362,9 @@ class BaseAdapter(ABC):
         """
         from playwright.async_api import async_playwright  # lazy import
 
-        settings = self._settings
-        proxy = {"server": settings.proxy_url} if settings.proxy_url else None
-
-        _LAUNCH_ARGS = [
-            "--no-sandbox",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--disable-setuid-sandbox",
-            "--no-zygote",
-            "--single-process",
-            "--disable-software-rasterizer",
-        ]
-
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                timezone_id="Asia/Kolkata",
-                proxy=proxy,
-            )
+            ctx = await self._new_context(browser)
             self._shared_context = ctx
             try:
                 yield ctx
@@ -340,7 +403,15 @@ class BaseAdapter(ABC):
                     try:
                         await page.wait_for_selector(wait_selector, timeout=15000)
                     except Exception:
-                        pass
+                        # Page loaded but the content selector never appeared —
+                        # usually a stale selector or a layout change. Surface it
+                        # so selector rot doesn't silently produce empty parses.
+                        logger.warning(
+                            "wait_selector_timeout",
+                            portal=self.PORTAL_NAME,
+                            url=url,
+                            selector=wait_selector,
+                        )
                 self._consecutive_nav_failures = 0
                 self._page_counter += 1
                 return await page.content()
@@ -371,22 +442,10 @@ class BaseAdapter(ABC):
                     )
                     self._page_counter = 0
                     try:
-                        await self._shared_context.close()
                         browser = self._shared_context.browser
+                        await self._shared_context.close()
                         if browser:
-                            recycle_proxy = {"server": self._settings.proxy_url} if self._settings.proxy_url else None
-                            ctx = await browser.new_context(
-                                user_agent=(
-                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                    "Chrome/124.0.0.0 Safari/537.36"
-                                ),
-                                viewport={"width": 1280, "height": 900},
-                                locale="en-US",
-                                timezone_id="Asia/Kolkata",
-                                proxy=recycle_proxy,
-                            )
-                            self._shared_context = ctx
+                            self._shared_context = await self._new_context(browser)
                     except Exception as exc:
                         logger.warning("context_recycle_failed", error=str(exc)[:200])
                 return html
@@ -397,33 +456,9 @@ class BaseAdapter(ABC):
         # Fallback: create a fresh browser for single-page fetches (e.g. parse_job_detail)
         from playwright.async_api import async_playwright  # lazy import
 
-        settings = self._settings
-        proxy = {"server": settings.proxy_url} if settings.proxy_url else None
-
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox",
-                    "--no-zygote",
-                    "--single-process",
-                    "--disable-software-rasterizer",
-                ],
-            )
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                timezone_id="Asia/Kolkata",
-                proxy=proxy,
-            )
+            browser = await p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            ctx = await self._new_context(browser)
             page = await ctx.new_page()
             try:
                 html = await self._navigate_with_retry(page, url, wait_selector)
