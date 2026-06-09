@@ -79,7 +79,9 @@ spec:
               # fallback and asset blocking, so the old per-page Chromium
               # launches (which OOMKilled this pod at 1280Mi) are gone.
               memory: "1Gi"
-              cpu: "500m"
+              # Chromium needs CPU headroom to finish JS-heavy detail pages
+              # promptly — at 500m a single render starves the whole pod.
+              cpu: "800m"
           livenessProbe:
             exec:
               command: ["bash", "-c", "pgrep -f 'celery.*worker' > /dev/null"]

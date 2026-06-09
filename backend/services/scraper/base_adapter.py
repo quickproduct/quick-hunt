@@ -21,13 +21,15 @@ logger = structlog.get_logger(__name__)
 
 # Chromium launch args shared by every browser launch (container-optimized,
 # minimal background work, capped JS heap).
+# NOTE: --single-process/--no-zygote are deliberately absent — they hang
+# new_page() indefinitely on this headless_shell build (verified on
+# aarch64/k3d June 2026); that hang is what built up the 145k-message
+# jh_scraping_detail backlog. Multi-process works with the same image.
 _LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-gpu",
     "--disable-dev-shm-usage",
     "--disable-setuid-sandbox",
-    "--no-zygote",
-    "--single-process",
     "--disable-software-rasterizer",
     "--blink-settings=imagesEnabled=false",
     "--disable-extensions",
