@@ -71,7 +71,7 @@ spec:
               mountPath: /dev/shm
           resources:
             requests:
-              memory: "512Mi"
+              memory: "384Mi"
               cpu: "150m"
             limits:
               memory: "1100Mi"  # Per-company task is short; cap below scraping-realtime

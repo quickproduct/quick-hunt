@@ -34,6 +34,46 @@ async def _kubectl(*args: str, timeout: int = 30) -> str:
     return stdout.decode(errors="replace").strip()
 
 
+# ── Dynamic worker/deployment discovery ───────────────────────────────────────
+# The static sets in config.py drifted from the cluster (consulting/mnc/detail
+# workers were missing), which made newer workers invisible to these tools and
+# masked a real outage. Discover live names from the cluster instead, falling
+# back to the static sets only when kubectl is unavailable.
+_discovery_cache: dict[str, tuple[float, set[str]]] = {}
+_DISCOVERY_TTL_SECONDS = 60.0
+
+
+async def _discover_names(kind: str) -> set[str]:
+    import time
+    now = time.monotonic()
+    cached = _discovery_cache.get(kind)
+    if cached and now - cached[0] < _DISCOVERY_TTL_SECONDS:
+        return cached[1]
+    out = await _kubectl("get", kind, "-o", "name", timeout=10)
+    names = {line.split("/", 1)[1] for line in out.splitlines() if "/" in line}
+    if names:
+        _discovery_cache[kind] = (now, names)
+    return names
+
+
+async def get_allowed_deployments() -> set[str]:
+    try:
+        return await _discover_names("deployments") or ALLOWED_K8S_DEPLOYMENTS
+    except Exception:
+        return ALLOWED_K8S_DEPLOYMENTS
+
+
+async def get_scalable_workers() -> set[str]:
+    """Workers with a KEDA ScaledObject (named '<worker>-scaler' by convention)."""
+    try:
+        scalers = await _discover_names("scaledobjects")
+        if scalers:
+            return {s.removesuffix("-scaler") for s in scalers if s.endswith("-scaler")}
+    except Exception:
+        pass
+    return KEDA_SCALABLE_WORKERS
+
+
 def register(mcp: FastMCP) -> None:
 
     # ── Pod / cluster status ──────────────────────────────────────────────────
@@ -144,14 +184,11 @@ def register(mcp: FastMCP) -> None:
         previous:   if True, fetch logs from the previous (crashed) container —
                     essential for diagnosing CrashLoopBackOff root cause
 
-        Allowed: api, beat, dashboard, ollama,
-                 worker-scraping-bulk, worker-scraping-realtime, worker-enrichment,
-                 worker-maintenance, worker-cover-bulk, worker-cover-ranking,
-                 worker-cover-generation, worker-cover-workflow, worker-email,
-                 worker-cover-batch
+        Allowed: any deployment currently in the namespace (discovered live via
+                 kubectl; includes consulting/mnc/detail workers).
         """
         deployment = deployment.strip().lower()
-        err = validate_choice(deployment, ALLOWED_K8S_DEPLOYMENTS, "deployment")
+        err = validate_choice(deployment, await get_allowed_deployments(), "deployment")
         if err:
             return err
         lines = clamp(lines, 1, 200)
@@ -211,7 +248,7 @@ def register(mcp: FastMCP) -> None:
         worker: e.g. 'worker-cover-generation', 'worker-scraping-realtime'
         """
         worker = worker.strip().lower()
-        err = validate_choice(worker, KEDA_SCALABLE_WORKERS, "worker")
+        err = validate_choice(worker, await get_scalable_workers(), "worker")
         if err:
             return err
         try:
@@ -231,7 +268,7 @@ def register(mcp: FastMCP) -> None:
         Note: cover-batch and beat are not KEDA-managed — no ScaledObject to pause.
         """
         worker = worker.strip().lower()
-        err = validate_choice(worker, KEDA_SCALABLE_WORKERS, "worker")
+        err = validate_choice(worker, await get_scalable_workers(), "worker")
         if err:
             return err
         scaler = f"{worker}-scaler"
@@ -253,7 +290,7 @@ def register(mcp: FastMCP) -> None:
         worker: e.g. 'worker-cover-generation', 'worker-scraping-bulk'
         """
         worker = worker.strip().lower()
-        err = validate_choice(worker, KEDA_SCALABLE_WORKERS, "worker")
+        err = validate_choice(worker, await get_scalable_workers(), "worker")
         if err:
             return err
         scaler = f"{worker}-scaler"
@@ -278,7 +315,7 @@ def register(mcp: FastMCP) -> None:
         deployment: e.g. 'api', 'worker-cover-generation', 'beat'
         """
         deployment = deployment.strip().lower()
-        err = validate_choice(deployment, ALLOWED_K8S_DEPLOYMENTS, "deployment")
+        err = validate_choice(deployment, await get_allowed_deployments(), "deployment")
         if err:
             return err
         try:
@@ -300,7 +337,7 @@ def register(mcp: FastMCP) -> None:
         replicas beyond KEDA's current target for a burst.
         """
         deployment = deployment.strip().lower()
-        err = validate_choice(deployment, ALLOWED_K8S_DEPLOYMENTS, "deployment")
+        err = validate_choice(deployment, await get_allowed_deployments(), "deployment")
         if err:
             return err
         replicas = clamp(replicas, 0, 10)
@@ -346,7 +383,7 @@ def register(mcp: FastMCP) -> None:
         deployment: e.g. 'worker-cover-generation', 'api'
         """
         deployment = deployment.strip().lower()
-        err = validate_choice(deployment, ALLOWED_K8S_DEPLOYMENTS, "deployment")
+        err = validate_choice(deployment, await get_allowed_deployments(), "deployment")
         if err:
             return err
 

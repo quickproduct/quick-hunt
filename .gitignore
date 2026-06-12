@@ -277,3 +277,5 @@ mobile/.expo/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 .claude
+# Personal resume PDFs (PII) — keep local only
+backend/resumes/*.pdf

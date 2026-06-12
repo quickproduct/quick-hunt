@@ -32,13 +32,15 @@ _COUNT_CACHE_TTL = 10
 
 def _list_cache_key(**params) -> str:
     return "jobs:list:" + hashlib.md5(
-        json.dumps(params, sort_keys=True, default=str).encode()
+        json.dumps(params, sort_keys=True, default=str).encode(),
+        usedforsecurity=False,
     ).hexdigest()
 
 
 def _count_cache_key(**params) -> str:
     return "jobs:count:" + hashlib.md5(
-        json.dumps(params, sort_keys=True, default=str).encode()
+        json.dumps(params, sort_keys=True, default=str).encode(),
+        usedforsecurity=False,
     ).hexdigest()
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])

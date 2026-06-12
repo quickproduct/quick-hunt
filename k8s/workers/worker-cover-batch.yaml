@@ -1,5 +1,6 @@
-# Rate-limited batch processor — ALWAYS exactly 1 replica, NO KEDA.
-# Two instances would violate the GROQ_RPM rate limit.
+# Rate-limited batch processor — NEVER more than 1 replica.
+# Two instances would violate the GROQ_RPM rate limit, so the KEDA scaler
+# below is capped at maxReplicaCount=1 (scales 0<->1 only).
 # concurrency=1 + prefetch-multiplier=1 ensure strictly one task at a time.
 apiVersion: apps/v1
 kind: Deployment
@@ -68,3 +69,28 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "100m"
+---
+# Scale 0<->1 only. maxReplicaCount=1 preserves the single-instance
+# invariant required by the GROQ_RPM rate limit; min=0 lets the pod
+# sleep when the batch queue is empty (most of the time).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-cover-batch-scaler
+  namespace: job-hunter
+spec:
+  scaleTargetRef:
+    name: worker-cover-batch
+  pollingInterval: 10
+  cooldownPeriod: 300
+  minReplicaCount: 0
+  maxReplicaCount: 1
+  triggers:
+    - type: rabbitmq
+      metadata:
+        protocol: http
+        queueName: jh_cover_letter_batch
+        mode: QueueLength
+        value: "10"
+      authenticationRef:
+        name: keda-trigger-auth-rabbitmq

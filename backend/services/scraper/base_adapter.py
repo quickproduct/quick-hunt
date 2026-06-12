@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import random
 import re
+import threading
 import urllib.robotparser
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
@@ -17,6 +18,130 @@ import structlog
 from services.api.core.config import get_settings
 
 logger = structlog.get_logger(__name__)
+
+# Chromium launch args shared by every browser launch (container-optimized,
+# minimal background work, capped JS heap).
+# NOTE: --single-process/--no-zygote are deliberately absent — they hang
+# new_page() indefinitely on this headless_shell build (verified on
+# aarch64/k3d June 2026); that hang is what built up the 145k-message
+# jh_scraping_detail backlog. Multi-process works with the same image.
+_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--disable-setuid-sandbox",
+    "--disable-software-rasterizer",
+    "--blink-settings=imagesEnabled=false",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--mute-audio",
+    "--no-first-run",
+    "--metrics-recording-only",
+    "--js-flags=--max-old-space-size=256",
+]
+
+# Context options shared by every browser context.
+_CONTEXT_KWARGS = {
+    "user_agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "viewport": {"width": 1280, "height": 720},
+    "locale": "en-US",
+    "timezone_id": "Asia/Kolkata",
+}
+
+# Third-party analytics/ads hosts that never contribute job content.
+_BLOCKED_HOST_FRAGMENTS = (
+    "googletagmanager.com",
+    "google-analytics.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "adsystem.com",
+    "connect.facebook.net",
+    "facebook.com/tr",
+    "hotjar.com",
+    "segment.com",
+    "segment.io",
+    "newrelic.com",
+    "nr-data.net",
+    "sentry-cdn.com",
+    "fullstory.com",
+    "clarity.ms",
+    "mixpanel.com",
+    "amplitude.com",
+    "criteo.com",
+    "scorecardresearch.com",
+    "quantserve.com",
+)
+
+# ------------------------------------------------------------------ #
+# Process-lifetime browser singleton (per worker thread)               #
+# ------------------------------------------------------------------ #
+# Detail tasks used to launch a fresh Playwright + Chromium per page —
+# a ~2-4s cold start and a large RSS spike for every single job detail.
+# Instead we keep one Chromium per worker thread, bound to the persistent
+# event loop from services.common.async_utils. Lifecycle is bounded by
+# Celery's --max-tasks-per-child; cleanup is best-effort on shutdown
+# (Chromium dies with the worker process either way).
+_browser_local = threading.local()
+
+
+async def _get_persistent_browser():
+    """Return this thread's long-lived Chromium, launching it on first use."""
+    loop = asyncio.get_running_loop()
+    state = getattr(_browser_local, "state", None)
+    if state is not None:
+        pw, browser, bound_loop = state
+        if bound_loop is loop and browser.is_connected():
+            return browser
+        # Loop was recreated or the browser died — discard the stale handle.
+        if bound_loop is loop:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        _browser_local.state = None
+
+    from playwright.async_api import async_playwright  # lazy import
+
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+    _browser_local.state = (pw, browser, loop)
+    logger.info("persistent_browser_launched")
+    return browser
+
+
+def _close_persistent_browser(**kwargs) -> None:
+    """Best-effort browser cleanup on worker shutdown (Celery signal)."""
+    state = getattr(_browser_local, "state", None)
+    if state is None:
+        return
+    pw, browser, bound_loop = state
+    _browser_local.state = None
+    try:
+        if not bound_loop.is_closed():
+            bound_loop.run_until_complete(browser.close())
+            bound_loop.run_until_complete(pw.stop())
+    except Exception:
+        pass
+
+
+try:
+    from celery.signals import worker_process_shutdown as _wps
+    _wps.connect(_close_persistent_browser)
+except Exception:
+    pass
+
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE)
 SKIP_DOMAINS = {
@@ -207,6 +332,18 @@ class BaseAdapter(ABC):
     PORTAL_NAME: str = "base"
     REQUESTS_PER_MINUTE: int = 10
     CONCURRENT_BROWSERS: int = 1
+    # Asset types aborted via route interception. Override per adapter if a
+    # portal genuinely needs one of these to render job content.
+    BLOCKED_RESOURCE_TYPES: frozenset = frozenset({"image", "media", "font", "stylesheet"})
+    # Detail pages: try a plain HTTP GET before falling back to a browser.
+    # Set False on adapters whose detail pages are JS-only (Indeed, Internshala,
+    # MNC career pages behind Workday/iCIMS/etc.).
+    DETAIL_HTTP_FIRST: bool = True
+    # Optional substring that must appear in HTTP-fetched HTML for it to count
+    # as a real detail page (guards against bot walls / empty shells).
+    DETAIL_CONTENT_MARKER: Optional[str] = None
+    # HTTP responses smaller than this are treated as bot walls / redirector stubs.
+    _MIN_DETAIL_HTML_BYTES = 2048
 
     def __init__(self) -> None:
         self._request_times: list[float] = []
@@ -267,6 +404,30 @@ class BaseAdapter(ABC):
     # ------------------------------------------------------------------ #
     # Playwright browser session — reuse across multiple page fetches     #
     # ------------------------------------------------------------------ #
+    async def _route_blocker(self, route) -> None:
+        """Abort requests for heavy assets and third-party analytics.
+
+        Job content lives in the DOM regardless of CSS/images, so blocking
+        these cuts most of the page's bytes and Chromium's layout/paint CPU.
+        Adapters that need an asset type can shrink BLOCKED_RESOURCE_TYPES.
+        """
+        request = route.request
+        if request.resource_type in self.BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+            return
+        url = request.url
+        if any(host in url for host in _BLOCKED_HOST_FRAGMENTS):
+            await route.abort()
+            return
+        await route.continue_()
+
+    async def _new_context(self, browser):
+        """Create a browser context with shared options + asset blocking."""
+        proxy = {"server": self._settings.proxy_url} if self._settings.proxy_url else None
+        ctx = await browser.new_context(**_CONTEXT_KWARGS, proxy=proxy)
+        await ctx.route("**/*", self._route_blocker)
+        return ctx
+
     @asynccontextmanager
     async def _browser_session(self):
         """Create a shared browser context for the duration of a scraping session.
@@ -276,32 +437,9 @@ class BaseAdapter(ABC):
         """
         from playwright.async_api import async_playwright  # lazy import
 
-        settings = self._settings
-        proxy = {"server": settings.proxy_url} if settings.proxy_url else None
-
-        _LAUNCH_ARGS = [
-            "--no-sandbox",
-            "--disable-gpu",
-            "--disable-dev-shm-usage",
-            "--disable-setuid-sandbox",
-            "--no-zygote",
-            "--single-process",
-            "--disable-software-rasterizer",
-        ]
-
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                timezone_id="Asia/Kolkata",
-                proxy=proxy,
-            )
+            ctx = await self._new_context(browser)
             self._shared_context = ctx
             try:
                 yield ctx
@@ -340,7 +478,15 @@ class BaseAdapter(ABC):
                     try:
                         await page.wait_for_selector(wait_selector, timeout=15000)
                     except Exception:
-                        pass
+                        # Page loaded but the content selector never appeared —
+                        # usually a stale selector or a layout change. Surface it
+                        # so selector rot doesn't silently produce empty parses.
+                        logger.warning(
+                            "wait_selector_timeout",
+                            portal=self.PORTAL_NAME,
+                            url=url,
+                            selector=wait_selector,
+                        )
                 self._consecutive_nav_failures = 0
                 self._page_counter += 1
                 return await page.content()
@@ -371,22 +517,10 @@ class BaseAdapter(ABC):
                     )
                     self._page_counter = 0
                     try:
-                        await self._shared_context.close()
                         browser = self._shared_context.browser
+                        await self._shared_context.close()
                         if browser:
-                            recycle_proxy = {"server": self._settings.proxy_url} if self._settings.proxy_url else None
-                            ctx = await browser.new_context(
-                                user_agent=(
-                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                    "Chrome/124.0.0.0 Safari/537.36"
-                                ),
-                                viewport={"width": 1280, "height": 900},
-                                locale="en-US",
-                                timezone_id="Asia/Kolkata",
-                                proxy=recycle_proxy,
-                            )
-                            self._shared_context = ctx
+                            self._shared_context = await self._new_context(browser)
                     except Exception as exc:
                         logger.warning("context_recycle_failed", error=str(exc)[:200])
                 return html
@@ -394,41 +528,46 @@ class BaseAdapter(ABC):
                 if not page.is_closed():
                     await page.close()
 
-        # Fallback: create a fresh browser for single-page fetches (e.g. parse_job_detail)
-        from playwright.async_api import async_playwright  # lazy import
+        # No shared context — single-page fetch (e.g. parse_job_detail).
+        # Most detail pages are server-rendered, so try plain HTTP first and
+        # only fall back to the (thread-persistent) browser when it fails.
+        if self.DETAIL_HTTP_FIRST:
+            html = await self._get_page_html_http(url)
+            if html is not None:
+                logger.info("detail_fetch_via", via="http", portal=self.PORTAL_NAME, url=url)
+                return html
 
-        settings = self._settings
-        proxy = {"server": settings.proxy_url} if settings.proxy_url else None
+        browser = await _get_persistent_browser()
+        ctx = await self._new_context(browser)
+        page = await ctx.new_page()
+        try:
+            html = await self._navigate_with_retry(page, url, wait_selector)
+            logger.info("detail_fetch_via", via="browser", portal=self.PORTAL_NAME, url=url)
+            return html
+        finally:
+            await ctx.close()
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    "--disable-setuid-sandbox",
-                    "--no-zygote",
-                    "--single-process",
-                    "--disable-software-rasterizer",
-                ],
-            )
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                timezone_id="Asia/Kolkata",
-                proxy=proxy,
-            )
-            page = await ctx.new_page()
-            try:
-                html = await self._navigate_with_retry(page, url, wait_selector)
-            finally:
-                await browser.close()
+    async def _get_page_html_http(self, url: str) -> Optional[str]:
+        """Fetch a detail page with plain HTTP. Returns None when the response
+        doesn't look like a usable detail page (caller falls back to browser)."""
+        headers = {
+            "User-Agent": _CONTEXT_KWARGS["user_agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
+                resp = await client.get(url)
+        except Exception as exc:
+            logger.debug("detail_http_fetch_error", url=url, error=str(exc)[:200])
+            return None
+        if resp.status_code != 200:
+            return None
+        html = resp.text
+        if len(html) < self._MIN_DETAIL_HTML_BYTES:
+            return None
+        if self.DETAIL_CONTENT_MARKER and self.DETAIL_CONTENT_MARKER not in html:
+            return None
         return html
 
     # ------------------------------------------------------------------ #

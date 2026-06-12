@@ -159,6 +159,9 @@ class MNCCareerAdapter(BaseAdapter):
 
     PORTAL_NAME = PORTAL_NAME
     REQUESTS_PER_MINUTE = 15
+    # Career-page details sit behind Workday/iCIMS/Taleo/BambooHR React shells;
+    # tiers 1-3 (Greenhouse/Lever/SmartRecruiters) already use JSON APIs directly.
+    DETAIL_HTTP_FIRST = False
     CONCURRENT_BROWSERS = 2
 
     # ── Public interface ───────────────────────────────────────────────────

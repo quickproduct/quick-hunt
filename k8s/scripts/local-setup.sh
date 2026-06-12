@@ -69,7 +69,8 @@ fi
 
 # ── Step 3: k3d registry ─────────────────────────────────────────────────────
 log "Step 3 — k3d local registry"
-if k3d registry list 2>/dev/null | grep -q "$REGISTRY_NAME"; then
+REGISTRY_LIST="$(k3d registry list 2>/dev/null || true)"  # capture first (see SIGPIPE note below)
+if grep -q "$REGISTRY_NAME" <<<"$REGISTRY_LIST"; then
   ok "Registry $REGISTRY_NAME already exists"
 else
   info "Creating k3d registry on port $REGISTRY_PORT..."
@@ -79,7 +80,11 @@ fi
 
 # ── Step 4: k3d cluster ──────────────────────────────────────────────────────
 log "Step 4 — k3d cluster ($CLUSTER_NAME)"
-if k3d cluster list 2>/dev/null | grep -q "$CLUSTER_NAME"; then
+# NOTE: capture into a var first — piping `k3d cluster list` directly into
+# `grep -q` makes grep close the pipe on first match, k3d then dies with SIGPIPE
+# (exit 141), and `set -o pipefail` propagates that, wrongly taking the else branch.
+CLUSTER_LIST="$(k3d cluster list 2>/dev/null || true)"
+if grep -q "$CLUSTER_NAME" <<<"$CLUSTER_LIST"; then
   ok "Cluster $CLUSTER_NAME already exists"
   k3d kubeconfig merge "$CLUSTER_NAME" --kubeconfig-merge-default &>/dev/null
   kubectl config use-context "k3d-$CLUSTER_NAME" &>/dev/null

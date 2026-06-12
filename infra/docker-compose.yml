@@ -33,7 +33,7 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5435:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jobhunter -d jobhunter"]
       interval: 5s
@@ -83,7 +83,7 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - "6379:6379"
+      - "6382:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -180,7 +180,7 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     deploy:
-      replicas: ${WORKER_SCRAPING_BULK_SCALE:-2}
+      replicas: ${WORKER_SCRAPING_BULK_SCALE:-1}
     environment:
       SERVICE_NAME: "worker-scraping-bulk"
       OTEL_SDK_DISABLED: "true"
@@ -215,14 +215,14 @@ services:
       context: ..
       dockerfile: infra/Dockerfile.worker
     env_file: ./.env
-    shm_size: "2g"
+    shm_size: "512m"
     cpus: 1.0
-    mem_limit: 2g
+    mem_limit: 1g
     restart: unless-stopped
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     deploy:
-      replicas: ${WORKER_SCRAPING_REALTIME_SCALE:-2}
+      replicas: ${WORKER_SCRAPING_REALTIME_SCALE:-1}
     environment:
       SERVICE_NAME: "worker-scraping-realtime"
       OTEL_SDK_DISABLED: "true"
@@ -263,7 +263,7 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     deploy:
-      replicas: ${WORKER_ENRICHMENT_SCALE:-3}
+      replicas: ${WORKER_ENRICHMENT_SCALE:-1}
     environment:
       SERVICE_NAME: "worker-enrichment"
       OTEL_SDK_DISABLED: "true"
@@ -345,7 +345,7 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     deploy:
-      replicas: ${WORKER_COVER_BULK_SCALE:-2}
+      replicas: ${WORKER_COVER_BULK_SCALE:-1}
     environment:
       SERVICE_NAME: "worker-cover-bulk"
       OTEL_SDK_DISABLED: "true"
@@ -386,7 +386,7 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     deploy:
-      replicas: ${WORKER_COVER_RANKING_SCALE:-2}
+      replicas: ${WORKER_COVER_RANKING_SCALE:-1}
     environment:
       SERVICE_NAME: "worker-cover-ranking"
       OTEL_SDK_DISABLED: "true"
@@ -428,7 +428,7 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     deploy:
-      replicas: ${WORKER_COVER_GENERATION_SCALE:-3}
+      replicas: ${WORKER_COVER_GENERATION_SCALE:-1}
     environment:
       SERVICE_NAME: "worker-cover-generation"
       OTEL_SDK_DISABLED: "true"
@@ -471,7 +471,7 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     deploy:
-      replicas: ${WORKER_COVER_WORKFLOW_SCALE:-2}
+      replicas: ${WORKER_COVER_WORKFLOW_SCALE:-1}
     environment:
       SERVICE_NAME: "worker-cover-workflow"
       OTEL_SDK_DISABLED: "true"
@@ -512,7 +512,7 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     deploy:
-      replicas: ${WORKER_EMAIL_SCALE:-2}
+      replicas: ${WORKER_EMAIL_SCALE:-1}
     environment:
       SERVICE_NAME: "worker-email"
       OTEL_SDK_DISABLED: "true"
@@ -615,9 +615,13 @@ services:
     image: ollama/ollama:latest
     container_name: ollama
     cpus: 1.5
-    mem_limit: 4g
+    mem_limit: 2g
+    environment:
+      # Unload the embedding model 2 minutes after the last request so the
+      # memory is reclaimed between scrape cycles (default keeps it forever).
+      OLLAMA_KEEP_ALIVE: "2m"
     ports:
-      - "11434:11434"
+      - "11436:11434"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
@@ -634,7 +638,7 @@ services:
       dockerfile: infra/Dockerfile.dashboard
     container_name: Frontend
     ports:
-      - "3001:3000"
+      - "3003:3000"
     env_file: ./.env
     restart: unless-stopped
     labels:

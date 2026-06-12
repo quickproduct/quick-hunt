@@ -79,7 +79,7 @@ class ShineAdapter(BaseAdapter):
 
         try:
             async with httpx.AsyncClient(
-                headers=_HEADERS, timeout=25, follow_redirects=True, verify=False
+                headers=_HEADERS, timeout=25, follow_redirects=True
             ) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()

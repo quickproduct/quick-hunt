@@ -1,6 +1,6 @@
 # Hottest path — LLM + Ollama embeddings.
 # Two KEDA triggers: KEDA scales to the MAX of both queue lengths.
-# minReplicaCount=1 (local: 8GB RAM shared with playwright scrapers)
+# minReplicaCount=0 — scales to zero when both queues are empty; KEDA wakes it in seconds.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -81,7 +81,7 @@ spec:
     name: worker-cover-generation
   pollingInterval: 5  # Fast polling — hottest path in the system
   cooldownPeriod: 300
-  minReplicaCount: 1
+  minReplicaCount: 0
   maxReplicaCount: 2
   triggers:
     - type: rabbitmq
