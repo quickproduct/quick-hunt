@@ -6,14 +6,14 @@ workers:
     - jh_scraping_bulk
     broker: rabbitmq
   scraping_realtime:
-    scale: 2
-    concurrency: 4
+    scale: 1
+    concurrency: 1
     queues:
     - jh_scraping_realtime
     broker: rabbitmq
   scraping_detail:
-    scale: 1
-    concurrency: 6
+    scale: 3
+    concurrency: 1
     queues:
     - jh_scraping_detail
     broker: rabbitmq

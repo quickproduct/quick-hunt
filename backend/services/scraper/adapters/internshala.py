@@ -16,8 +16,9 @@ class InternshalaAdapter(BaseAdapter):
     PORTAL_NAME = "internshala"
     REQUESTS_PER_MINUTE = 8
     CONCURRENT_BROWSERS = 1
-    # Internshala is a React SPA — detail content only exists after JS runs.
-    DETAIL_HTTP_FIRST = False
+    # Detail pages are server-rendered (verified June 2026) — plain HTTP works.
+    DETAIL_HTTP_FIRST = True
+    DETAIL_CONTENT_MARKER = "internship_details"
 
     BASE_URL = "https://internshala.com"
 
@@ -121,22 +122,27 @@ class InternshalaAdapter(BaseAdapter):
             return None
         await self._rate_limit()
         try:
-            html = await self._get_page_html(url, wait_selector="div.internship-heading-container, div[class*='jd-detail']")
+            html = await self._get_page_html(url, wait_selector="div.detail_view, div.internship_details")
         except Exception as exc:
             logger.warning("detail_fetch_error", url=url, error=str(exc))
             return None
 
         soup = BeautifulSoup(html, "lxml")
-        title_el = soup.select_one("h1.profile") or soup.select_one("h1")
+        title_el = soup.select_one("h1.heading_title") or soup.select_one("h1.profile") or soup.select_one("h1")
         title = title_el.get_text(strip=True) if title_el else "Unknown"
 
-        company_el = soup.select_one("div.company-name a") or soup.select_one("[class*='company-name']")
+        company_el = (
+            soup.select_one("div.company_name a")
+            or soup.select_one("div.company-name a")
+            or soup.select_one("[class*='company-name']")
+        )
         company = company_el.get_text(strip=True) if company_el else "Unknown"
         company_href = company_el.get("href", "") if company_el else ""
         company_website = company_href if company_href.startswith("http") else None
 
         desc_el = (
-            soup.select_one("div.internship-details div.text-container")
+            soup.select_one("div.internship_details div.text-container")
+            or soup.select_one("div.internship-details div.text-container")
             or soup.select_one("div[class*='about-company']")
             or soup.select_one("div.container-fluid.detail-wrapper")
         )

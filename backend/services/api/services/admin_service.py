@@ -520,6 +520,7 @@ def apply_performance_mode(mode: str) -> dict[str, Any]:
 _WORKER_HOSTNAME_PREFIX: dict[str, str] = {
     "scraping_bulk":          "scraping-bulk",
     "scraping_realtime":      "scraping-realtime",
+    "scraping_detail":        "scraping-detail",
     "enrichment":             "enrichment",
     "maintenance":            "maintenance",
     "cover_bulk":             "cover-bulk",
@@ -537,6 +538,7 @@ _WORKER_HOSTNAME_PREFIX: dict[str, str] = {
 _WORKER_K8S_DEPLOYMENT: dict[str, str] = {
     "scraping_bulk":         "worker-scraping-bulk",
     "scraping_realtime":     "worker-scraping-realtime",
+    "scraping_detail":       "worker-scraping-detail",
     "enrichment":            "worker-enrichment",
     "maintenance":           "worker-maintenance",
     "cover_bulk":            "worker-cover-bulk",
@@ -551,7 +553,7 @@ _WORKER_K8S_DEPLOYMENT: dict[str, str] = {
 
 # Workers that have KEDA ScaledObjects (cover_batch and maintenance do not)
 _KEDA_MANAGED: frozenset[str] = frozenset({
-    "scraping_bulk", "scraping_realtime", "enrichment",
+    "scraping_bulk", "scraping_realtime", "scraping_detail", "enrichment",
     "cover_bulk", "cover_ranking", "cover_generation", "cover_workflow", "email",
     "scraping_mnc_dispatch", "scraping_mnc_company",
 })
@@ -957,6 +959,7 @@ async def get_workers_live_status() -> dict[str, Any]:
 _WORKER_DOCKER_MAP: dict[str, str] = {
     "scraping_bulk":         "worker-scraping-bulk",
     "scraping_realtime":     "worker-scraping-realtime",
+    "scraping_detail":       "worker-scraping-detail",
     "enrichment":            "worker-enrichment",
     "maintenance":           "worker-maintenance",
     "cover_bulk":            "worker-cover-bulk",
