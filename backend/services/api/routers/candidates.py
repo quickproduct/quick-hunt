@@ -83,6 +83,7 @@ async def update_candidate(
 
 
 _RESUMES_DIR = Path(__file__).resolve().parent.parent.parent.parent / "resumes"
+_MAX_RESUME_BYTES = 5 * 1024 * 1024
 
 
 @router.post("/{candidate_id}/resume", response_model=CandidateOut)
@@ -100,13 +101,18 @@ async def upload_resume(
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="Only PDF files are accepted")
 
+    content = await file.read(_MAX_RESUME_BYTES + 1)
+    if len(content) > _MAX_RESUME_BYTES:
+        raise HTTPException(status_code=413, detail="Resume must be 5MB or smaller")
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=422, detail="File is not a valid PDF")
+
     # Derive a clean filename from the candidate name
     safe_name = candidate.name.lower().replace(" ", "-")
     filename = f"{safe_name}-resume.pdf"
 
     _RESUMES_DIR.mkdir(parents=True, exist_ok=True)
     dest = _RESUMES_DIR / filename
-    content = await file.read()
     dest.write_bytes(content)
 
     candidate.resume_url = f"resumes/{filename}"

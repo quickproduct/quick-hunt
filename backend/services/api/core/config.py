@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -201,6 +201,29 @@ class Settings(BaseSettings):
         default="https://cloud.langfuse.com",
         validation_alias=AliasChoices("langfuse_host", "LANGFUSE_HOST", "LANGFUSE_BASE_URL"),
     )
+
+    # ── Production safety ─────────────────────────────────────────────────────
+    # Refuse to boot a production deployment that still uses the insecure
+    # placeholder secrets above. Development keeps the convenient defaults.
+    _INSECURE_DEFAULTS = {
+        "admin_api_key": "change-me-secret",
+        "secret_key": "jwt-secret-key",
+        "jwt_secret": "change-me-jwt-secret-32-chars-minimum",
+    }
+
+    @model_validator(mode="after")
+    def _reject_default_secrets_in_production(self) -> "Settings":
+        if self.environment == "production":
+            unchanged = [
+                name for name, default in self._INSECURE_DEFAULTS.items()
+                if getattr(self, name) == default
+            ]
+            if unchanged:
+                raise ValueError(
+                    f"ENVIRONMENT=production but insecure default values are still set "
+                    f"for: {', '.join(unchanged)}. Override them in infra/.env."
+                )
+        return self
 
 
 @lru_cache()

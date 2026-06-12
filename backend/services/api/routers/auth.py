@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.database import get_db
 from services.api.core.dependencies import CurrentUser
+from services.api.core.rate_limit import rate_limit
 from services.api.schemas.auth_schemas import (
     ForgotPasswordRequest,
     LoginRequest,
@@ -19,12 +20,21 @@ from services.api.services import auth_service
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/register", response_model=TokenResponse, status_code=201)
+@router.post(
+    "/register",
+    response_model=TokenResponse,
+    status_code=201,
+    dependencies=[Depends(rate_limit("register", max_requests=5, window_seconds=3600))],
+)
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     return await auth_service.register(db, body.tenant_name, body.email, body.password)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    dependencies=[Depends(rate_limit("login", max_requests=10, window_seconds=300))],
+)
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     return await auth_service.login(db, body.email, body.password)
 
@@ -44,7 +54,11 @@ async def verify_email(body: VerifyEmailRequest, db: AsyncSession = Depends(get_
     await auth_service.verify_email(db, body.token)
 
 
-@router.post("/forgot-password", status_code=204)
+@router.post(
+    "/forgot-password",
+    status_code=204,
+    dependencies=[Depends(rate_limit("forgot-password", max_requests=5, window_seconds=3600))],
+)
 async def forgot_password(body: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
     await auth_service.forgot_password(db, body.email)
 

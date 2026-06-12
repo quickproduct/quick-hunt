@@ -7,6 +7,35 @@ on:
     branches: [main]
 
 jobs:
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so gitleaks scans every commit, not just HEAD
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Dependency vulnerability audit (pip-audit)
+        run: |
+          pip install pip-audit
+          pip-audit -r backend/requirements-shared.txt --strict || true  # report-only until baseline is clean
+      - name: Static security analysis (bandit)
+        # Gate on high-severity/high-confidence; medium findings are report-only
+        # until the B608 text()-query baseline is reviewed.
+        run: |
+          pip install bandit
+          bandit -r backend/services -lll -iii -x backend/tests
+          bandit -r backend/services -ll -x backend/tests --exit-zero
+
   test:
     runs-on: ubuntu-latest
 
