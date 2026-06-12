@@ -71,7 +71,7 @@ spec:
               mountPath: /dev/shm
           resources:
             requests:
-              memory: "512Mi"
+              memory: "320Mi"
               cpu: "200m"
             limits:
               memory: "1Gi"  # Playwright peaks at 1-1.3GB process + 1GB SHM under real scraping

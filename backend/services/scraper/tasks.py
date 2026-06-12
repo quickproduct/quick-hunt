@@ -616,11 +616,15 @@ def _scrape_lock_key(portal: str, query_dict: dict, candidate_id: str | None) ->
         {"p": portal, "q": query_dict, "c": candidate_id},
         sort_keys=True, separators=(",", ":"),
     )
-    digest = hashlib.sha1(payload.encode()).hexdigest()[:16]
+    digest = hashlib.sha1(payload.encode(), usedforsecurity=False).hexdigest()[:16]
     return f"scrape:inflight:{portal}:{digest}"
 
 
 _SCRAPE_LOCK_TTL = 2000  # > task hard limit (1920s) — auto-expires on crash
+
+# Backpressure cap for jh_scraping_detail — discovery stops fanning out detail
+# tasks past this depth so the queue can never grow unbounded again.
+MAX_DETAIL_QUEUE_DEPTH = 2000
 
 
 @celery_app.task(
@@ -710,7 +714,24 @@ def scrape_portal_task(
 
         saved_job_ids = await _save_jobs_batch(complete, candidate_id) if complete else []
 
-        # Stage 4: fan out detail fetches as individual tasks
+        # Stage 4: fan out detail fetches as individual tasks.
+        # Backpressure: detail tasks drain far slower than discovery produces
+        # them (a single Playwright pod manages ~0.2 tasks/s), so an unbounded
+        # fan-out grows jh_scraping_detail without limit (observed at 144k).
+        # Skipped jobs are not saved, so the next scrape cycle re-discovers
+        # them and fans out when the queue has capacity.
+        if needs_detail:
+            detail_depth = await _get_queue_depth("jh_scraping_detail")
+            if detail_depth is not None and detail_depth > MAX_DETAIL_QUEUE_DEPTH:
+                logger.warning(
+                    "detail_fanout_skipped_queue_full",
+                    portal=portal,
+                    queue_depth=detail_depth,
+                    max_depth=MAX_DETAIL_QUEUE_DEPTH,
+                    skipped=len(needs_detail),
+                )
+                needs_detail = []
+
         if needs_detail:
             bp = BatchPublisher(chunk_size=50)
             for payload in needs_detail:
@@ -1324,8 +1345,8 @@ def scrape_mnc_jobs_task(
 # Beat-scheduled task                                                  #
 # ------------------------------------------------------------------ #
 
-async def _get_realtime_queue_depth() -> int | None:
-    """Query RabbitMQ Management API for jh_scraping_realtime queue depth.
+async def _get_queue_depth(queue_name: str) -> int | None:
+    """Query RabbitMQ Management API for a queue's depth.
 
     Returns message count (ready + unacked), or None on failure.
     """
@@ -1347,23 +1368,28 @@ async def _get_realtime_queue_depth() -> int | None:
         vhost_encoded = quote(vhost, safe="")
 
         if rabbit_url.startswith("amqps://"):
-            mgmt_url = f"https://{host}:443/api/queues/{vhost_encoded}/jh_scraping_realtime"
+            mgmt_url = f"https://{host}:443/api/queues/{vhost_encoded}/{queue_name}"
         else:
-            mgmt_url = f"http://{host}:15672/api/queues/{vhost_encoded}/jh_scraping_realtime"
+            mgmt_url = f"http://{host}:15672/api/queues/{vhost_encoded}/{queue_name}"
 
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(mgmt_url, auth=(user, password))
             if resp.status_code == 200:
                 return resp.json().get("messages", 0) or 0
             logger.warning(
-                "realtime_queue_depth_api_error",
+                "queue_depth_api_error",
+                queue=queue_name,
                 status=resp.status_code,
                 body=resp.text[:200],
             )
             return None
     except Exception as exc:
-        logger.warning("realtime_queue_depth_failed", error=str(exc))
+        logger.warning("queue_depth_failed", queue=queue_name, error=str(exc))
         return None
+
+
+async def _get_realtime_queue_depth() -> int | None:
+    return await _get_queue_depth("jh_scraping_realtime")
 
 
 @celery_app.task(name="services.scraper.tasks.scheduled_scrape")
