@@ -51,7 +51,7 @@ spec:
             - --without-mingle
             - --without-gossip
             - --max-tasks-per-child=100
-            - --hostname=cover-bulk-%(n)s@%h
+            - --hostname=cover-bulk@%h
           env:
             - name: SERVICE_NAME
               value: "worker-cover-bulk"

@@ -51,7 +51,7 @@ spec:
             - --without-mingle
             - --without-gossip
             - --max-tasks-per-child=100
-            - --hostname=cover-ranking-%(n)s@%h
+            - --hostname=cover-ranking@%h
           env:
             - name: SERVICE_NAME
               value: "worker-cover-ranking"

@@ -476,7 +476,7 @@ class BaseAdapter(ABC):
                 await page.goto(url, wait_until="domcontentloaded", timeout=self._NAV_TIMEOUT)
                 if wait_selector:
                     try:
-                        await page.wait_for_selector(wait_selector, timeout=15000)
+                        await page.wait_for_selector(wait_selector, timeout=5000)
                     except Exception:
                         # Page loaded but the content selector never appeared —
                         # usually a stale selector or a layout change. Surface it

@@ -55,7 +55,7 @@ spec:
             # it to the OS, so RSS climbs to ~800Mi over a few hundred tasks. A lower
             # ceiling caps that growth (paired with MALLOC_ARENA_MAX in the configmap).
             - --max-tasks-per-child=50
-            - --hostname=enrichment-%(n)s@%h
+            - --hostname=enrichment@%h
           env:
             - name: SERVICE_NAME
               value: "worker-enrichment"

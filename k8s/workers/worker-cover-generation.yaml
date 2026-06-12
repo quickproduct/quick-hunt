@@ -54,7 +54,7 @@ spec:
             - --without-mingle
             - --without-gossip
             - --max-tasks-per-child=50
-            - --hostname=cover-generation-%(n)s@%h
+            - --hostname=cover-generation@%h
           env:
             - name: SERVICE_NAME
               value: "worker-cover-generation"

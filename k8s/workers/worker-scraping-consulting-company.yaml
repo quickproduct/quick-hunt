@@ -57,7 +57,7 @@ spec:
             - --without-mingle
             - --without-gossip
             - --max-tasks-per-child=20  # Recycle to release Playwright memory
-            - --hostname=scraping-consulting-company-%(n)s@%h
+            - --hostname=scraping-consulting-company@%h
           env:
             - name: SERVICE_NAME
               value: "worker-scraping-consulting-company"
