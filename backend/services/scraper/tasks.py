@@ -876,6 +876,25 @@ async def _filter_unseen_jobs(raw_jobs: list) -> list:
     return [rj for rj in raw_jobs if rj.dedupe_hash not in existing]
 
 
+async def _job_exists(dedupe_hash: str) -> bool:
+    """True when a job with this dedupe_hash is already saved.
+
+    Detail tasks can sit in jh_scraping_detail for days; the job may have been
+    saved by a later scrape cycle in the meantime. One indexed SELECT here is
+    far cheaper than a detail-page fetch.
+    """
+    from sqlalchemy import select
+    from services.api.core.database import get_worker_session_factory
+    from services.api.models.db import Job
+
+    session_factory = get_worker_session_factory()
+    async with session_factory() as session:
+        result = await session.execute(
+            select(Job.id).where(Job.dedupe_hash == dedupe_hash).limit(1)
+        )
+        return result.first() is not None
+
+
 @celery_app.task(
     name="services.scraper.tasks.scrape_job_detail_task",
     bind=True,
@@ -913,6 +932,10 @@ def scrape_job_detail_task(
 
     async def _run() -> int:
         job_data = _payload_to_job_data(raw_job_payload)
+        dedupe_hash = job_data.get("dedupe_hash")
+        if dedupe_hash and await _job_exists(dedupe_hash):
+            logger.info("detail_task_skipped_existing", url=url, portal=portal)
+            return 0
         if not job_data.get("job_description"):
             try:
                 detailed = await adapter.parse_job_detail(url)

@@ -56,8 +56,7 @@ spec:
             - -E
             - --without-mingle
             - --without-gossip
-            - --max-tasks-per-child=10
-            - --hostname=scraping-realtime-%(n)s@%h
+            - --hostname=scraping-realtime@%h
           env:
             - name: SERVICE_NAME
               value: "worker-scraping-realtime"

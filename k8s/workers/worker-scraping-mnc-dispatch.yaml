@@ -53,7 +53,7 @@ spec:
             - --without-mingle
             - --without-gossip
             - --max-tasks-per-child=200
-            - --hostname=scraping-mnc-dispatch-%(n)s@%h
+            - --hostname=scraping-mnc-dispatch@%h
           env:
             - name: SERVICE_NAME
               value: "worker-scraping-mnc-dispatch"

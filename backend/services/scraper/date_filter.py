@@ -68,7 +68,7 @@ def parse_relative_date(text: str) -> Optional[datetime]:
     raw = text.strip()
     low = raw.lower()
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
 
     # ── Exact keyword matches ────────────────────────────────────────────
     if low in ("today", "just now", "just posted", "posted recently",
@@ -167,7 +167,7 @@ def parse_relative_date(text: str) -> Optional[datetime]:
 def get_freshness_cutoff(max_age_days: int | None = None) -> datetime:
     """Return the datetime threshold: jobs posted *before* this are stale."""
     days = max_age_days if max_age_days is not None else _DEFAULT_MAX_AGE_DAYS
-    return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    return datetime.now(timezone.utc) - timedelta(days=days)
 
 
 def is_job_fresh(
@@ -190,11 +190,13 @@ def is_job_fresh(
         return not strict
 
     cutoff = get_freshness_cutoff(max_age_days)
-
-    # Handle timezone-aware datetimes by stripping tzinfo for comparison
     pd = posted_date
-    if pd.tzinfo is not None:
-        pd = pd.replace(tzinfo=None)
+
+    # Normalize both to aware datetimes for consistent comparison
+    if pd.tzinfo is None:
+        pd = pd.replace(tzinfo=timezone.utc)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
 
     return pd >= cutoff
 

@@ -51,7 +51,7 @@ spec:
             - --without-mingle
             - --without-gossip
             - --max-tasks-per-child=500
-            - --hostname=maintenance-%(n)s@%h
+            - --hostname=maintenance@%h
           env:
             - name: SERVICE_NAME
               value: "worker-maintenance"

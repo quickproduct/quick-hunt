@@ -18,24 +18,27 @@ class Base(DeclarativeBase):
 def get_engine():
     """API engine — larger pool for concurrent HTTP request handling."""
     settings = get_settings()
-    kwargs: dict = dict(
-        pool_size=20,
-        max_overflow=20,   # 40 max connections per API process
-        pool_timeout=30,   # tolerate checkpoint I/O spikes (was 10)
-        echo=False,
-        pool_pre_ping=True,  # Always validate connections — detects stale/bad-state
-    )
-    if not settings.postgres_local:
-        # Neon serverless: recycle connections before the 5-min idle suspend,
-        # disable JIT (Neon rec).
-        kwargs["pool_recycle"] = 240
-        kwargs["connect_args"] = {"server_settings": {"jit": "off", "statement_timeout": "60000"}}
-    else:
-        kwargs["connect_args"] = {"server_settings": {"statement_timeout": "60000"}}
-    if settings.db_pgbouncer:
-        # PgBouncer transaction pooling: disable asyncpg server-side prepared
-        # statement caching (see Settings.db_pgbouncer).
-        kwargs["connect_args"]["statement_cache_size"] = 0
+    is_postgres = settings.database_url.startswith("postgresql")
+    kwargs: dict = dict(echo=False)
+
+    if is_postgres:
+        kwargs.update(dict(
+            pool_size=20,
+            max_overflow=20,   # 40 max connections per API process
+            pool_timeout=30,   # tolerate checkpoint I/O spikes (was 10)
+            pool_pre_ping=True,  # Always validate connections — detects stale/bad-state
+        ))
+        if not settings.postgres_local:
+            # Neon serverless: recycle connections before the 5-min idle suspend,
+            # disable JIT (Neon rec).
+            kwargs["pool_recycle"] = 240
+            kwargs["connect_args"] = {"server_settings": {"jit": "off", "statement_timeout": "60000"}}
+        else:
+            kwargs["connect_args"] = {"server_settings": {"statement_timeout": "60000"}}
+        if settings.db_pgbouncer:
+            # PgBouncer transaction pooling: disable asyncpg server-side prepared
+            # statement caching (see Settings.db_pgbouncer).
+            kwargs["connect_args"]["statement_cache_size"] = 0
     return create_async_engine(settings.database_url, **kwargs)
 
 
@@ -54,19 +57,22 @@ def get_worker_engine():
       ensures connections are returned promptly.
     """
     settings = get_settings()
-    kwargs: dict = dict(
-        pool_size=2,
-        max_overflow=3,
-        pool_timeout=60,
-        pool_pre_ping=True,
-        echo=False,
-        pool_recycle=1800,
-    )
-    if not settings.postgres_local:
-        kwargs["connect_args"] = {"server_settings": {"jit": "off"}}
-    if settings.db_pgbouncer:
-        # PgBouncer transaction pooling: disable asyncpg prepared-statement cache.
-        kwargs.setdefault("connect_args", {})["statement_cache_size"] = 0
+    is_postgres = settings.database_url.startswith("postgresql")
+    kwargs: dict = dict(echo=False)
+
+    if is_postgres:
+        kwargs.update(dict(
+            pool_size=2,
+            max_overflow=3,
+            pool_timeout=60,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        ))
+        if not settings.postgres_local:
+            kwargs["connect_args"] = {"server_settings": {"jit": "off"}}
+        if settings.db_pgbouncer:
+            # PgBouncer transaction pooling: disable asyncpg prepared-statement cache.
+            kwargs.setdefault("connect_args", {})["statement_cache_size"] = 0
     return create_async_engine(settings.database_url, **kwargs)
 
 
