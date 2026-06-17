@@ -133,6 +133,26 @@ def send_application_email_task(
                 await session.commit()
                 return {"status": "skipped", "reason": "placeholder email — real HR email not yet discovered"}
 
+            # Don't re-apply to an address the registry already knows is dead
+            # (hard-bounced / blocked / spam-flagged / fake). Clearing hr_email
+            # drops it from the send-dispatch query and lets backfill re-discover
+            # a better address (bounded by hr_email_discovery_attempts). This is
+            # a primary defense against repeat bounces.
+            if to_email and not override_email and job.tenant_id:
+                from services.api.models.hr_email_utils import get_hr_email_status
+
+                status_row = await get_hr_email_status(session, str(job.tenant_id), to_email)
+                if status_row and status_row[0] in ("bounced", "invalid", "fake"):
+                    logger.info(
+                        "send_skipped_known_bad_email",
+                        job_id=job_id,
+                        company=job.company,
+                        validation_status=status_row[0],
+                    )
+                    job.hr_email = None
+                    await session.commit()
+                    return {"status": "skipped", "reason": f"hr_email registry status={status_row[0]}"}
+
             # If no HR email found yet, run inline discovery before giving up.
             if not to_email and not settings.email_test_override:
                 from services.scraper.tasks import _discover_email_for_job

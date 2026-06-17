@@ -24,6 +24,28 @@ def _extract_domain(email: str) -> str:
     return email.lower().strip().rsplit("@", 1)[-1]
 
 
+async def get_hr_email_status(
+    session: AsyncSession, tenant_id: str, email: str
+) -> Optional[tuple[str, bool]]:
+    """Return ``(validation_status, is_placeholder)`` for a registered HR email,
+    or None if the address isn't in the registry yet.
+
+    Used by the sender to avoid re-applying to addresses already known to be
+    dead (hard-bounced / blocked / spam-flagged / fake) — a primary lever
+    against the bounce rate."""
+    email_lower = email.lower().strip()
+    result = await session.execute(
+        select(HrEmail.validation_status, HrEmail.is_placeholder).where(
+            HrEmail.tenant_id == tenant_id,
+            HrEmail.email == email_lower,
+        )
+    )
+    row = result.first()
+    if row is None:
+        return None
+    return (row[0], bool(row[1]))
+
+
 async def upsert_hr_email(
     session: AsyncSession,
     tenant_id: str,

@@ -5,9 +5,9 @@ from typing import Optional
 from urllib.parse import quote_plus
 
 import structlog
-from bs4 import BeautifulSoup
 
 from services.scraper.base_adapter import BaseAdapter, JobQuery, RawJob, extract_emails_from_text
+from services.scraper.html import BeautifulSoup
 
 logger = structlog.get_logger(__name__)
 
@@ -19,6 +19,11 @@ class InternshalaAdapter(BaseAdapter):
     # Detail pages are server-rendered (verified June 2026) — plain HTTP works.
     DETAIL_HTTP_FIRST = True
     DETAIL_CONTENT_MARKER = "internship_details"
+    # List/search pages are server-rendered too — fetch them over HTTP and skip
+    # Chromium entirely. The marker is the job-card class present in the SSR HTML;
+    # if it's absent (bot wall) the base adapter falls back to the browser.
+    LIST_HTTP_FIRST = True
+    LIST_CONTENT_MARKER = "individual_internship"
 
     BASE_URL = "https://internshala.com"
 

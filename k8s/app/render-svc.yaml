@@ -1,0 +1,87 @@
+# render-svc — the single bounded home for Chromium.
+#
+# Once scraping workers point at this service (RENDER_SVC_URL), they no longer
+# launch Playwright themselves: the whole ~20Gi of per-pod Chromium that used to
+# scale unbounded across detail/realtime/bulk/mnc/consulting collapses into this
+# one Deployment with a fixed tab pool. Always-on (1 replica) so it stays warm;
+# memory is bounded by RENDER_MAX_TABS, not by KEDA fan-out.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: render-svc
+  namespace: job-hunter
+  labels:
+    app: render-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: render-svc
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: render-svc
+    spec:
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi  # Chrome runs with --disable-dev-shm-usage
+      containers:
+        - name: render-svc
+          image: k3d-jh-registry:5050/jh-render:local
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: RENDER_MAX_TABS
+              value: "3"            # hard cap on concurrent tabs = bounded RAM
+            - name: RENDER_NAV_TIMEOUT_MS
+              value: "45000"
+            - name: PORT
+              value: "8080"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              # One Chrome + up to 3 tabs with asset blocking + capped JS heap.
+              memory: "1536Mi"
+              cpu: "1500m"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: render-svc
+  namespace: job-hunter
+  labels:
+    app: render-svc
+spec:
+  selector:
+    app: render-svc
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP

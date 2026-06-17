@@ -11,9 +11,9 @@ from typing import Optional
 
 import httpx
 import structlog
-from bs4 import BeautifulSoup
 
 from services.scraper.base_adapter import BaseAdapter, JobQuery, RawJob, extract_emails_from_text
+from services.scraper.html import BeautifulSoup
 
 logger = structlog.get_logger(__name__)
 

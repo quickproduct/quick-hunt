@@ -1,6 +1,7 @@
 """Base scraper adapter — all portal adapters inherit from BaseAdapter."""
 import asyncio
 import hashlib
+import os
 import random
 import re
 import threading
@@ -18,6 +19,14 @@ import structlog
 from services.api.core.config import get_settings
 
 logger = structlog.get_logger(__name__)
+
+# Sentinel so _get_page_html_http can distinguish "no marker arg passed"
+# (fall back to DETAIL_CONTENT_MARKER) from an explicit marker of None.
+_UNSET = object()
+
+# Marker stored in self._shared_context during a list-scrape session when
+# fetching is delegated to render-svc (no local browser is launched).
+_RENDER_SESSION = object()
 
 # Chromium launch args shared by every browser launch (container-optimized,
 # minimal background work, capped JS heap).
@@ -342,6 +351,11 @@ class BaseAdapter(ABC):
     # Optional substring that must appear in HTTP-fetched HTML for it to count
     # as a real detail page (guards against bot walls / empty shells).
     DETAIL_CONTENT_MARKER: Optional[str] = None
+    # List/search pages: try plain HTTP before a browser. Off by default — turn
+    # on per adapter whose list page is server-rendered (e.g. internshala) to
+    # skip Chromium entirely; falls back to the browser if HTTP looks bot-walled.
+    LIST_HTTP_FIRST: bool = False
+    LIST_CONTENT_MARKER: Optional[str] = None
     # HTTP responses smaller than this are treated as bot walls / redirector stubs.
     _MIN_DETAIL_HTML_BYTES = 2048
 
@@ -428,24 +442,42 @@ class BaseAdapter(ABC):
         await ctx.route("**/*", self._route_blocker)
         return ctx
 
+    @staticmethod
+    def _render_svc_url() -> Optional[str]:
+        """Base URL of render-svc when fetching is delegated to it, else None."""
+        return os.getenv("RENDER_SVC_URL") or None
+
     @asynccontextmanager
     async def _browser_session(self):
-        """Create a shared browser context for the duration of a scraping session.
+        """Open a shared browser context for the duration of a scraping session.
 
-        While inside this context, _get_page_html opens new tabs in the existing
-        browser instead of launching a fresh browser per page — a major speedup.
+        When RENDER_SVC_URL is set, fetching is delegated to render-svc and no
+        local browser is launched — the session just marks list-scrape mode.
+        Otherwise reuses the thread-persistent Chromium singleton (launched once
+        per worker thread) instead of launching a fresh Playwright + Chromium per
+        session. The old per-session launch cost ~2-4s and a large RSS spike on
+        every list scrape; now only the lightweight context is created and torn
+        down per session while the browser stays warm for the next task.
         """
-        from playwright.async_api import async_playwright  # lazy import
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
-            ctx = await self._new_context(browser)
-            self._shared_context = ctx
+        if self._render_svc_url():
+            self._shared_context = _RENDER_SESSION
             try:
-                yield ctx
+                yield None
             finally:
                 self._shared_context = None
-                await browser.close()
+            return
+
+        browser = await _get_persistent_browser()
+        ctx = await self._new_context(browser)
+        self._shared_context = ctx
+        try:
+            yield ctx
+        finally:
+            self._shared_context = None
+            try:
+                await ctx.close()  # close the context; keep the browser alive
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # Playwright page fetcher                                              #
@@ -504,8 +536,31 @@ class BaseAdapter(ABC):
         raise last_exc or RuntimeError(f"All navigation retries exhausted for {url}")
 
     async def _get_page_html(self, url: str, wait_selector: Optional[str] = None) -> str:
-        """Navigate to URL and return HTML. Reuses the shared browser context when available."""
-        if self._shared_context is not None:
+        """Navigate to URL and return HTML.
+
+        Routing: render-svc (if RENDER_SVC_URL set) → shared browser context
+        (list scraping) → HTTP-first / thread-persistent browser (single detail).
+        """
+        is_list = self._shared_context is not None  # inside a _browser_session
+
+        render_url = self._render_svc_url()
+        if render_url:
+            http_first = self.LIST_HTTP_FIRST if is_list else self.DETAIL_HTTP_FIRST
+            marker = self.LIST_CONTENT_MARKER if is_list else self.DETAIL_CONTENT_MARKER
+            html = await self._fetch_via_render_svc(render_url, url, wait_selector, http_first, marker)
+            if html is not None:
+                return html
+            # render-svc unreachable/failed — fall through to the local fetch path.
+
+        if self._shared_context is not None and self._shared_context is not _RENDER_SESSION:
+            # List scraping: server-rendered portals can skip Chromium entirely.
+            # Try plain HTTP first, falling back to the shared browser context
+            # on bot walls / empty responses.
+            if self.LIST_HTTP_FIRST:
+                html = await self._get_page_html_http(url, content_marker=self.LIST_CONTENT_MARKER)
+                if html is not None:
+                    logger.info("list_fetch_via", via="http", portal=self.PORTAL_NAME, url=url)
+                    return html
             page = await self._shared_context.new_page()
             try:
                 html = await self._navigate_with_retry(page, url, wait_selector)
@@ -547,9 +602,13 @@ class BaseAdapter(ABC):
         finally:
             await ctx.close()
 
-    async def _get_page_html_http(self, url: str) -> Optional[str]:
-        """Fetch a detail page with plain HTTP. Returns None when the response
-        doesn't look like a usable detail page (caller falls back to browser)."""
+    async def _get_page_html_http(self, url: str, content_marker=_UNSET) -> Optional[str]:
+        """Fetch a page with plain HTTP. Returns None when the response doesn't
+        look like a usable page (caller falls back to browser).
+
+        ``content_marker`` defaults to ``DETAIL_CONTENT_MARKER`` (detail fetches);
+        list callers pass ``LIST_CONTENT_MARKER`` explicitly (which may be None)."""
+        marker = self.DETAIL_CONTENT_MARKER if content_marker is _UNSET else content_marker
         headers = {
             "User-Agent": _CONTEXT_KWARGS["user_agent"],
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -566,9 +625,50 @@ class BaseAdapter(ABC):
         html = resp.text
         if len(html) < self._MIN_DETAIL_HTML_BYTES:
             return None
-        if self.DETAIL_CONTENT_MARKER and self.DETAIL_CONTENT_MARKER not in html:
+        if marker and marker not in html:
             return None
         return html
+
+    async def _fetch_via_render_svc(
+        self,
+        base_url: str,
+        url: str,
+        wait_selector: Optional[str],
+        http_first: bool,
+        content_marker: Optional[str],
+    ) -> Optional[str]:
+        """Fetch a page through render-svc (Go fetch/render service).
+
+        render-svc does HTTP-first + a bounded shared-Chrome fallback; this
+        worker keeps all parsing. Returns None on any failure so the caller
+        falls back to the local fetch path (keeping the system resilient if
+        render-svc is down)."""
+        payload = {
+            "url": url,
+            "wait_selector": wait_selector or "",
+            "http_first": bool(http_first),
+            "content_marker": content_marker or "",
+            "block_assets": True,
+            "timeout_ms": self._NAV_TIMEOUT,
+        }
+        try:
+            timeout = self._NAV_TIMEOUT / 1000 + 15
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(f"{base_url.rstrip('/')}/fetch", json=payload)
+            if resp.status_code != 200:
+                logger.warning("render_svc_non_200", status=resp.status_code, url=url)
+                return None
+            data = resp.json()
+            if data.get("error"):
+                logger.warning("render_svc_error", error=str(data["error"])[:200], url=url)
+                return None
+            logger.info(
+                "fetch_via_render_svc", via=data.get("via"), portal=self.PORTAL_NAME, url=url
+            )
+            return data.get("html") or None
+        except Exception as exc:
+            logger.warning("render_svc_request_failed", error=str(exc)[:200], url=url)
+            return None
 
     # ------------------------------------------------------------------ #
     # Email discovery                                                      #

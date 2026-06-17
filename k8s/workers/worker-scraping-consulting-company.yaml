@@ -7,7 +7,7 @@ metadata:
     app: worker-scraping-consulting-company
     worker-type: scraping
 spec:
-  replicas: 0  # KEDA scales 0 → 3 based on queue depth (node-memory bound)
+  replicas: 0  # KEDA scales 0 → 1 based on queue depth (node-memory bound)
   selector:
     matchLabels:
       app: worker-scraping-consulting-company
@@ -38,7 +38,9 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 1Gi  # Playwright browser peaks at ~800MB SHM under load
+            # 512Mi is sufficient with asset blocking (images/css/fonts/media
+            # aborted via route interception) capping Chromium's SHM footprint.
+            sizeLimit: 512Mi
       containers:
         - name: worker
           image: k3d-jh-registry:5050/jh-worker-playwright:local
@@ -96,7 +98,10 @@ spec:
   cooldownPeriod: 300
   idleReplicaCount: 0   # Scale fully to zero when queue is empty
   minReplicaCount: 0
-  maxReplicaCount: 3
+  # Capped 3 → 1 (Tier 0): on a single ~8GB node, mnc + consulting + detail
+  # used to scale to 3 each simultaneously (~16Gi of Chromium) and OOM the
+  # node. Company scrapes are background/non-latency-sensitive, so serialize.
+  maxReplicaCount: 1
   triggers:
     - type: rabbitmq
       metadata:

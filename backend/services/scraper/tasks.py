@@ -684,6 +684,8 @@ def scrape_portal_task(
     async def _run():
         # Stage 1: discover — list jobs from the portal (cheap, one HTTP/Playwright call)
         raw_jobs = await adapter.search_jobs(query)
+        # Selector-rot signal: track consecutive zero-yield scrapes per portal.
+        await _record_portal_scrape_health(portal, len(raw_jobs))
         if not raw_jobs:
             return 0
 
@@ -1750,7 +1752,7 @@ async def _find_email_from_site(website: str) -> str | None:
         if not homepage_html:
             return []
         try:
-            from bs4 import BeautifulSoup
+            from services.scraper.html import BeautifulSoup
             soup = BeautifulSoup(homepage_html, "lxml")
             extra: list[str] = []
             seen = set(pages)
@@ -2889,6 +2891,74 @@ def purge_old_dated_jobs_task() -> dict:
 
 
 # ------------------------------------------------------------------ #
+# Selector-rot signal                                                  #
+# ------------------------------------------------------------------ #
+# A portal that normally returns jobs but yields 0 across several consecutive
+# scheduled scrapes has almost certainly had its selectors rot or been blocked.
+# We count consecutive zero-yield list scrapes per portal in Redis; the health
+# check surfaces portals over the threshold so rot is caught instead of silently
+# returning empty results forever.
+_PORTAL_ZERO_YIELD_PREFIX = "scrape:zero_yield:"
+_SELECTOR_ROT_THRESHOLD = 3
+_PORTAL_ZERO_YIELD_TTL = 6 * 3600  # > the 2h scrape interval, so a recovery expires
+
+
+async def _record_portal_scrape_health(portal: str, raw_count: int) -> None:
+    """Track consecutive zero-yield list scrapes per portal (selector-rot signal).
+
+    Reset to 0 on any non-empty scrape; increment (with TTL) on an empty one."""
+    try:
+        import redis.asyncio as aioredis
+
+        from services.api.core.config import get_settings
+
+        redis = aioredis.from_url(get_settings().redis_url, decode_responses=True)
+        key = f"{_PORTAL_ZERO_YIELD_PREFIX}{portal}"
+        try:
+            if raw_count > 0:
+                await redis.delete(key)
+            else:
+                await redis.incr(key)
+                await redis.expire(key, _PORTAL_ZERO_YIELD_TTL)
+        finally:
+            await redis.aclose()
+    except Exception as exc:
+        logger.debug("portal_scrape_health_record_failed", portal=portal, error=str(exc)[:120])
+
+
+async def _scan_selector_rot() -> list[str]:
+    """Return portals whose consecutive zero-yield count is at/over the threshold."""
+    try:
+        import redis.asyncio as aioredis
+
+        from services.api.core.config import get_settings
+
+        redis = aioredis.from_url(get_settings().redis_url, decode_responses=True)
+        rotted: list[str] = []
+        try:
+            cursor = 0
+            while True:
+                cursor, keys = await redis.scan(
+                    cursor, match=f"{_PORTAL_ZERO_YIELD_PREFIX}*", count=100
+                )
+                for key in keys:
+                    try:
+                        count = int(await redis.get(key) or 0)
+                    except (TypeError, ValueError):
+                        count = 0
+                    if count >= _SELECTOR_ROT_THRESHOLD:
+                        rotted.append(key[len(_PORTAL_ZERO_YIELD_PREFIX):])
+                if cursor == 0:
+                    break
+        finally:
+            await redis.aclose()
+        return sorted(rotted)
+    except Exception as exc:
+        logger.debug("selector_rot_scan_failed", error=str(exc)[:120])
+        return []
+
+
+# ------------------------------------------------------------------ #
 # Pipeline health check (every 15 min)                                #
 # ------------------------------------------------------------------ #
 @celery_app.task(
@@ -2961,6 +3031,13 @@ def pipeline_health_check_task() -> dict:
                 )
                 auto_approved = r.rowcount
             fixes["auto_approved"] = auto_approved
+
+            # Fix 4: selector-rot signal — portals returning 0 jobs across
+            # several consecutive scheduled scrapes (selectors rotted / blocked).
+            rotted = await _scan_selector_rot()
+            if rotted:
+                logger.warning("selector_rot_suspected", portals=rotted)
+            fixes["selector_rot_suspected"] = rotted
 
             # Per-status counts for monitoring
             for status in ["new", "filtered", "scoring", "cover_generated", "pending_approval"]:

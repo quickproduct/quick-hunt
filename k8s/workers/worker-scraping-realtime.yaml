@@ -37,7 +37,10 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 1Gi  # Playwright browser peaks at ~800MB SHM under load
+            # Chromium runs with --disable-dev-shm-usage, so it barely touches
+            # /dev/shm; 512Mi bounds the memory-backed tmpfs (counts toward the
+            # container limit) and frees headroom for process RSS.
+            sizeLimit: 512Mi
       containers:
         - name: worker
           image: k3d-jh-registry:5050/jh-worker-playwright:local
@@ -73,7 +76,11 @@ spec:
               memory: "384Mi"
               cpu: "200m"
             limits:
-              memory: "1536Mi"
+              # Tier 1: list scraping now reuses the persistent Chromium
+              # singleton (no per-session relaunch spike) and /dev/shm dropped
+              # to 512Mi, so the process gets MORE of the limit (768Mi vs the
+              # old 512Mi after shm) at a lower ceiling. 1536 → 1280Mi.
+              memory: "1280Mi"
               cpu: "1000m"
           livenessProbe:
             exec:
