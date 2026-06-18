@@ -24,6 +24,11 @@ class InternshalaAdapter(BaseAdapter):
     # if it's absent (bot wall) the base adapter falls back to the browser.
     LIST_HTTP_FIRST = True
     LIST_CONTENT_MARKER = "individual_internship"
+    # First portal cut over to render-svc (Tier 1 pilot). Server-rendered +
+    # HTTP-first, so it's the safest A/B-parity target before expanding the
+    # flag to the browser-dependent portals (Indeed/MNC) where the in-pod
+    # Chromium savings actually land.
+    USE_RENDER_SVC = True
 
     BASE_URL = "https://internshala.com"
 

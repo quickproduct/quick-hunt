@@ -13,7 +13,13 @@ metadata:
   namespace: job-hunter
 spec:
   hard:
-    requests.memory: "16Gi"
+    # requests.memory capped near node-allocatable (8Gi node) so KEDA over-scale
+    # lands as Pending (graceful) rather than scheduling onto a full node and
+    # OOM-killing core pods. Current full-scale-up requests are ~6.7Gi.
+    requests.memory: "7Gi"
+    # limits.memory stays high until Tier 1.2 right-sizes per-pod limits — today
+    # the sum of Chromium-pod limits is ~22Gi. Drop to ~12Gi AFTER the render-svc
+    # cutover removes in-pod Chromium (else pods get rejected by the quota).
     limits.memory: "40Gi"
     requests.cpu: "6000m"
     limits.cpu: "24000m"

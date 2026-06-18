@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
                 logger.warning("db_warmup_one_failed", error=str(exc))
 
         try:
-            await asyncio.gather(*[_warm_one() for _ in range(10)])  # pool_size=10
+            await asyncio.gather(*[_warm_one() for _ in range(3)])  # warm a few; pool grows on demand
             logger.info("db_pool_warmed_up")
         except Exception as exc:
             logger.warning("db_warmup_failed", error=str(exc))
