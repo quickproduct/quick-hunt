@@ -61,6 +61,9 @@ spec:
           env:
             - name: SERVICE_NAME
               value: "worker-scraping-bulk"
+            # Tier 1 render-svc cutover (per-portal via USE_RENDER_SVC flag).
+            - name: RENDER_SVC_URL
+              value: "http://render-svc.job-hunter.svc.cluster.local"
           envFrom:
             - configMapRef:
                 name: job-hunter-config

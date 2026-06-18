@@ -94,7 +94,7 @@ metadata:
 spec:
   scaleTargetRef:
     name: worker-scraping-mnc-company
-  pollingInterval: 5
+  pollingInterval: 15   # relaxed from 5s — per-company backlog isn't latency-sensitive
   cooldownPeriod: 300
   idleReplicaCount: 0   # Scale fully to zero when queue is empty
   minReplicaCount: 0

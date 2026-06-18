@@ -356,6 +356,10 @@ class BaseAdapter(ABC):
     # skip Chromium entirely; falls back to the browser if HTTP looks bot-walled.
     LIST_HTTP_FIRST: bool = False
     LIST_CONTENT_MARKER: Optional[str] = None
+    # Per-portal render-svc cutover gate. When True (and RENDER_SVC_URL is set on
+    # the worker), this adapter's fetches route through render-svc instead of an
+    # in-pod browser. Default False so the cutover rolls out one portal at a time.
+    USE_RENDER_SVC: bool = False
     # HTTP responses smaller than this are treated as bot walls / redirector stubs.
     _MIN_DETAIL_HTML_BYTES = 2048
 
@@ -381,8 +385,15 @@ class BaseAdapter(ABC):
             sleep = 60 - (now - self._request_times[0]) + random.uniform(0.5, 1.5)
             await asyncio.sleep(max(sleep, 0))
         self._request_times.append(loop.time())
-        # Polite crawl delay (configurable, default 2.0s with ±25% jitter)
-        delay = self._settings.default_crawl_delay_seconds
+        # Polite crawl delay (configurable, ±25% jitter). Single detail fetches
+        # (no shared browser session → _shared_context is None) use the smaller
+        # detail delay: they're HTTP-first single GETs, so 2s list-politeness
+        # isn't warranted. List scraping keeps the full delay.
+        delay = (
+            self._settings.detail_crawl_delay_seconds
+            if self._shared_context is None
+            else self._settings.default_crawl_delay_seconds
+        )
         await asyncio.sleep(delay * random.uniform(0.75, 1.25))
 
     # ------------------------------------------------------------------ #
@@ -442,9 +453,15 @@ class BaseAdapter(ABC):
         await ctx.route("**/*", self._route_blocker)
         return ctx
 
-    @staticmethod
-    def _render_svc_url() -> Optional[str]:
-        """Base URL of render-svc when fetching is delegated to it, else None."""
+    def _render_svc_url(self) -> Optional[str]:
+        """Base URL of render-svc when THIS adapter delegates fetching to it.
+
+        Per-portal gate: only adapters with USE_RENDER_SVC=True route through
+        render-svc, so the cutover rolls out one portal at a time even though
+        RENDER_SVC_URL is set process-wide on the worker.
+        """
+        if not self.USE_RENDER_SVC:
+            return None
         return os.getenv("RENDER_SVC_URL") or None
 
     @asynccontextmanager
@@ -508,7 +525,7 @@ class BaseAdapter(ABC):
                 await page.goto(url, wait_until="domcontentloaded", timeout=self._NAV_TIMEOUT)
                 if wait_selector:
                     try:
-                        await page.wait_for_selector(wait_selector, timeout=5000)
+                        await page.wait_for_selector(wait_selector, timeout=2000)
                     except Exception:
                         # Page loaded but the content selector never appeared —
                         # usually a stale selector or a layout change. Surface it

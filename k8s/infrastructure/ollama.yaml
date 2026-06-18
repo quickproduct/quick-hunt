@@ -22,6 +22,10 @@ spec:
       initContainers:
         - name: model-pull
           image: ollama/ollama:latest
+          # IfNotPresent: reuse the node-cached image on KEDA 0->1 scale-ups
+          # instead of re-pulling :latest each time (the ImagePullBackOff cause
+          # — a re-pull was canceled under node memory pressure).
+          imagePullPolicy: IfNotPresent
           command: ["sh", "-c", "ollama serve & sleep 5 && ollama pull nomic-embed-text || true"]
           volumeMounts:
             - name: ollama-data
@@ -36,6 +40,7 @@ spec:
       containers:
         - name: ollama
           image: ollama/ollama:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 11434
           volumeMounts:

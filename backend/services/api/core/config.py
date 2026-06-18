@@ -122,6 +122,11 @@ class Settings(BaseSettings):
     proxy_url: str = ""
     respect_robots_txt: bool = True
     default_crawl_delay_seconds: float = 2.0
+    # Single detail-page fetches are HTTP-first (one GET per job), so the 2s
+    # list-politeness delay isn't needed there. A smaller delay ~4x's the
+    # detail-queue drain rate (was the ~0.4 msg/s bottleneck). List scraping
+    # keeps default_crawl_delay_seconds.
+    detail_crawl_delay_seconds: float = 0.5
     linkedin_client_id: str = ""
     linkedin_client_secret: str = ""
 

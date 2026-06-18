@@ -23,8 +23,8 @@ def get_engine():
 
     if is_postgres:
         kwargs.update(dict(
-            pool_size=20,
-            max_overflow=20,   # 40 max connections per API process
+            pool_size=10,
+            max_overflow=10,   # 20 max connections per API process (was 40; in practice ~1 in use)
             pool_timeout=30,   # tolerate checkpoint I/O spikes (was 10)
             pool_pre_ping=True,  # Always validate connections — detects stale/bad-state
         ))
