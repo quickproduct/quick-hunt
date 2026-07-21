@@ -187,6 +187,11 @@ deploy_cluster() {
     apply_manifest "$file"
   done
 
+  # Re-run pods even when manifests have the same image tag. This matters when
+  # infra/.env changed and Kubernetes Secrets were refreshed in-place.
+  log "Restarting deployments so pods pick up refreshed images and secrets..."
+  $K rollout restart deployment
+
   if [[ -f "$K8S_DIR/ingress/ingress.yaml" ]]; then
     if grep -q "CHANGE_ME" "$K8S_DIR/ingress/ingress.yaml"; then
       log "Skipping ingress because k8s/ingress/ingress.yaml still has CHANGE_ME placeholders."
