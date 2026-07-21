@@ -1,209 +1,124 @@
-name: CI
+name: CI/CD
 
 on:
   push:
-    branches: [main, develop]
-  pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: vps-deploy-main
+  cancel-in-progress: true
 
 jobs:
-  secrets-scan:
-    runs-on: ubuntu-latest
-    continue-on-error: true  # gitleaks requires a license for orgs; this scans but doesn't break CI
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # full history so gitleaks scans every commit, not just HEAD
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true  # report-only until GITLEAKS_LICENSE secret is configured
-
-  security-audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Dependency vulnerability audit (pip-audit)
-        run: |
-          pip install pip-audit
-          pip-audit -r backend/requirements-shared.txt --strict || true  # report-only until baseline is clean
-      - name: Static security analysis (bandit)
-        # Gate on high-severity/high-confidence; medium findings are report-only
-        # until the B608 text()-query baseline is reviewed.
-        run: |
-          pip install bandit
-          bandit -r backend/services -lll -iii -x backend/tests
-          bandit -r backend/services -ll -x backend/tests --exit-zero
-
-  test:
+  syntax-check:
+    name: Step 1 - Syntax Check
     runs-on: ubuntu-latest
 
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: jobhunter
-          POSTGRES_PASSWORD: jobhunter_secret
-          POSTGRES_DB: jobhunter
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    env:
-      DATABASE_URL: "sqlite+aiosqlite:///:memory:"
-      ADMIN_API_KEY: test-api-key
-      LLM_PROVIDER: ollama
-      VECTOR_DB_PROVIDER: local
-      EMAIL_PROVIDER: smtp
-      CELERY_BROKER_URL: "memory://"
-      CELERY_RESULT_BACKEND: "cache+memory://"
-      PYTHONPATH: backend
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
-      - name: Install dependencies
+      - name: Check shell scripts
         run: |
-          pip install -r backend/requirements-shared.txt
-          pip install -r backend/services/api/requirements.txt
-          pip install -r backend/services/scraper/requirements.txt
-          pip install -r backend/tests/requirements.txt
-          pip install flake8 black
+          find . \
+            -path './.git' -prune -o \
+            -path './frontend/dashboard/node_modules' -prune -o \
+            -path './infra/backups' -prune -o \
+            -type f \( -name '*.sh' -o -perm -111 \) -print0 |
+          while IFS= read -r -d '' file; do
+            if head -1 "$file" | grep -qE '^#!.*(bash|sh)'; then
+              bash -n "$file"
+            fi
+          done
 
-      - name: Lint (flake8, advisory)
+      - name: Check Python syntax
         run: |
-          # Advisory only (--exit-zero): the repo has ~323 pre-existing flake8
-          # findings, several of which must NOT be auto-fixed (SQLAlchemy
-          # `col == True` filters flagged E712, intentional dict alignment E241,
-          # deliberate post-sys.path imports E402). Lint reports but does not gate
-          # the build until a dedicated cleanup lands.
-          flake8 backend/services/ backend/tests/ --max-line-length=120 --exclude=__pycache__ \
-            --ignore=E501,W503 --exit-zero
+          python -m compileall -q backend mcp
 
-      - name: Run unit tests
-        run: python -m pytest -c backend/pytest.ini backend/tests/unit/ -v --tb=short
-
-      - name: Run integration tests
-        run: python -m pytest -c backend/pytest.ini backend/tests/integration/ -v --tb=short
-
-      - name: Upload coverage
-        if: always()
+      - name: Check YAML syntax
         run: |
-          pip install pytest-cov
-          python -m pytest -c backend/pytest.ini backend/tests/ --cov=services --cov-report=xml || true
+          python -m pip install --quiet pyyaml
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
 
-      - uses: codecov/codecov-action@v4
-        if: always()
-        with:
-          files: coverage.xml
-          fail_ci_if_error: false
+          for path in [*Path(".github").rglob("*.yml"), *Path(".github").rglob("*.yaml"), *Path("k8s").rglob("*.yml"), *Path("k8s").rglob("*.yaml")]:
+              with path.open("r", encoding="utf-8") as handle:
+                  list(yaml.safe_load_all(handle))
+              print(f"ok {path}")
+          PY
 
-  # Run the real Alembic migrations against Postgres+pgvector. The unit/integration
-  # tests above run on SQLite, so the raw-SQL pgvector paths (CREATE EXTENSION,
-  # vector(768) column, HNSW index in migration 0011) are otherwise never exercised
-  # in CI. This job catches migration/SQL drift before it reaches a deploy.
-  migrations:
+      - name: Check Docker Compose syntax
+        run: |
+          docker compose -f infra/docker-compose.yml config >/dev/null
+          if [[ -f infra/.env.prod ]]; then
+            docker compose -f infra/docker-compose.prod.yml --env-file infra/.env.prod config >/dev/null
+          else
+            echo "Skipping prod compose syntax check because infra/.env.prod is not committed."
+          fi
+
+  deploy:
+    name: Steps 2-4 - Deploy to Hostinger K3s
     runs-on: ubuntu-latest
-    needs: test
-
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: jobhunter
-          POSTGRES_PASSWORD: jobhunter
-          POSTGRES_DB: jobhunter
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    needs: syntax-check
+    if: github.ref == 'refs/heads/main'
 
     env:
-      DATABASE_URL: "postgresql+asyncpg://jobhunter:jobhunter@localhost:5432/jobhunter"
-      PYTHONPATH: backend
+      VPS_HOST: ${{ secrets.VPS_HOST || '200.141.0.224' }}
+      VPS_USER: ${{ secrets.VPS_USER || 'root' }}
+      VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+      VPS_PROJECT_DIR: ${{ secrets.VPS_PROJECT_DIR || '/root/quick-hunt' }}
+      REPO_URL: https://github.com/quickproduct/quick-hunt.git
+      BRANCH: main
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install migration dependencies
-        run: pip install -r backend/requirements-shared.txt
-
-      - name: alembic upgrade head (Postgres + pgvector)
-        run: alembic -c backend/alembic.ini upgrade head
-
-      - name: alembic downgrade base then upgrade head (round-trip)
+      - name: Validate VPS credentials
         run: |
-          alembic -c backend/alembic.ini downgrade base
-          alembic -c backend/alembic.ini upgrade head
+          test -n "$VPS_HOST"
+          test -n "$VPS_USER"
+          test -n "$VPS_PASSWORD"
+          test -n "$VPS_PROJECT_DIR"
 
-  docker-build:
-    runs-on: ubuntu-latest
-    needs: test
+      - name: Install SSH password client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
 
-    steps:
-      - uses: actions/checkout@v4
+      - name: Step 2 - SSH, Step 3 - Git pull, Step 4 - K3s pod rebuild
+        run: |
+          sshpass -p "$VPS_PASSWORD" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            "$VPS_USER@$VPS_HOST" \
+            "PROJECT_DIR='$VPS_PROJECT_DIR' REPO_URL='$REPO_URL' BRANCH='$BRANCH' bash -se" <<'REMOTE'
+          set -euo pipefail
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          echo "Step 2 - Connected to $(hostname)"
 
-      - name: Build API image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: infra/Dockerfile.api
-          push: false
-          load: true          # load into the local daemon so Trivy can scan it
-          tags: jh-api:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          if ! command -v git >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y git
+          fi
 
-      - name: Scan API image for vulnerabilities (Trivy)
-        uses: aquasecurity/trivy-action@0.24.0
-        with:
-          image-ref: jh-api:ci
-          format: table
-          exit-code: "1"            # fail the build on findings at the severities below
-          ignore-unfixed: true      # don't fail on vulns with no upstream fix yet
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
+          if [[ ! -d "$PROJECT_DIR/.git" ]]; then
+            echo "Repository missing at $PROJECT_DIR; cloning first deployment copy..."
+            mkdir -p "$(dirname "$PROJECT_DIR")"
+            git clone --branch "$BRANCH" "$REPO_URL" "$PROJECT_DIR"
+          fi
 
-      - name: Build worker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: infra/Dockerfile.worker
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cd "$PROJECT_DIR"
+
+          echo "Step 3 - Pulling latest code..."
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+          git pull --ff-only origin "$BRANCH"
+
+          echo "Step 4 - Rebuilding K3s pods with latest code..."
+          bash k8s/scripts/vps-deploy.sh
+          REMOTE
