@@ -11,6 +11,7 @@ a new Langfuse trace is created automatically.
 """
 from __future__ import annotations
 
+
 from typing import Any
 
 import structlog

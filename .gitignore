@@ -29,15 +29,15 @@ frontend/dashboard/.env.production.local
 # -----------------------------------------------------------------------------
 # DATABASE BACKUPS & DUMPS
 # -----------------------------------------------------------------------------
-# infra/backups/*.sql
-# backend/backupDb/*.sql
-# infra/backups/*.dump
-# infra/backups/*.backup
-# infra/backups/*.gz
-# infra/backups/*.zip
-# *.sqlite
-# *.sqlite3
-# *.db
+infra/backups/**/*.sql
+backend/backupDb/**/*.sql
+infra/backups/**/*.dump
+infra/backups/**/*.backup
+infra/backups/**/*.gz
+infra/backups/**/*.zip
+*.sqlite
+*.sqlite3
+*.db
 
 # -----------------------------------------------------------------------------
 # PYTHON - Backend
