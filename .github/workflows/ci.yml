@@ -55,6 +55,7 @@ jobs:
 
       - name: Check Docker Compose syntax
         run: |
+          cp infra/.env.example infra/.env
           docker compose -f infra/docker-compose.yml config >/dev/null
           if [[ -f infra/.env.prod ]]; then
             docker compose -f infra/docker-compose.prod.yml --env-file infra/.env.prod config >/dev/null
