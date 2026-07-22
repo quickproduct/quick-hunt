@@ -104,7 +104,7 @@ spec:
   pollingInterval: 5  # Fast polling — latency-sensitive
   cooldownPeriod: 300
   minReplicaCount: 0
-  maxReplicaCount: 1
+  maxReplicaCount: 3
   triggers:
     - type: rabbitmq
       metadata:

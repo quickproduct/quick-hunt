@@ -107,11 +107,10 @@ spec:
   pollingInterval: 15   # relaxed from 5s — detail backlog isn't latency-sensitive; lighter on RabbitMQ mgmt API
   cooldownPeriod: 300
   minReplicaCount: 0
-  # 1 → 3 originally to drain a 31k+ backlog. Capped 3 → 2 (Tier 0): detail
-  # tasks are HTTP-first (~100-200Mi/pod), but Indeed/MNC detail pages fall
-  # back to Chromium, so this bounds detail's Chromium count to 2 and keeps
-  # the detail+company simultaneous-backlog peak inside the single ~8GB node.
-  maxReplicaCount: 2
+  # Detail tasks are mostly HTTP-first, but some portals fall back to Chromium.
+  # On the 16Gi VPS, cap at 5 so backlogs drain faster without unbounded browser
+  # fan-out.
+  maxReplicaCount: 5
   triggers:
     - type: rabbitmq
       metadata:

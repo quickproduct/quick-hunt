@@ -6,7 +6,7 @@ Create Date: 2026-04-07 00:00:00.000000
 
 Updates existing candidate email addresses:
   - Suraj Shetty: shetty44444@gmail.com → srshetty@surajshetty.online
-  - Gunjan Pandey: gunjanap2018@gmail.com → gunjanpandey@quickspin.cloud
+  - Gunjan Pandey: gunjanap2018@gmail.com → gunjan@gunjanpandey.online
 """
 from alembic import op
 from sqlalchemy import text
@@ -24,7 +24,7 @@ EMAIL_UPDATES = [
     },
     {
         "old_email": "gunjanap2018@gmail.com",
-        "new_email": "gunjanpandey@quickspin.cloud",
+        "new_email": "gunjan@gunjanpandey.online",
         "name": "Gunjan Pandey"
     }
 ]

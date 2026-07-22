@@ -98,10 +98,9 @@ spec:
   cooldownPeriod: 300
   idleReplicaCount: 0   # Scale fully to zero when queue is empty
   minReplicaCount: 0
-  # Capped 3 → 1 (Tier 0): on a single ~8GB node, mnc + consulting + detail
-  # used to scale to 3 each simultaneously (~16Gi of Chromium) and OOM the
-  # node. Company scrapes are background/non-latency-sensitive, so serialize.
-  maxReplicaCount: 1
+  # 16Gi VPS: allow more company workers, but cap at 3 because these can still
+  # invoke Chromium during page discovery.
+  maxReplicaCount: 3
   triggers:
     - type: rabbitmq
       metadata:

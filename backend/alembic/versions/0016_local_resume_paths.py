@@ -23,7 +23,7 @@ RESUME_MAP = [
         "resume_url": "resumes/suraj-shetty-software-engineer.pdf",
     },
     {
-        "email": "gunjanpandey@quickspin.cloud",
+        "email": "gunjan@gunjanpandey.online",
         "resume_url": "resumes/gunjan-pandey-software-engineer.pdf",
     },
 ]
@@ -60,4 +60,3 @@ def downgrade() -> None:
             text("UPDATE candidates SET resume_url = :url WHERE email = :email"),
             {"email": entry["email"], "url": f"{R2_BASE}/{filename}"},
         )
-
