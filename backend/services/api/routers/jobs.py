@@ -1,9 +1,11 @@
 """Jobs router — list, filter, detail, status update, cover letter generation, bulk ops."""
 import hashlib
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import asc, desc, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,6 +47,7 @@ def _count_cache_key(**params) -> str:
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 Auth = Annotated[User, Depends(get_current_user)]
+logger = structlog.get_logger(__name__)
 
 
 def _apply_job_filters(
@@ -620,6 +623,18 @@ async def bulk_send(
             ignore_result=True,
         )
         task_ids.append(task.id)
+
+    skipped_by_reason = Counter(item.reason for item in skipped)
+    logger.info(
+        "bulk_send_completed",
+        candidate_id=body.candidate_id,
+        requested=len(body.job_ids),
+        queued=len(task_ids),
+        skipped=len(skipped),
+        skipped_by_reason=dict(skipped_by_reason),
+        attach_resume=body.attach_resume,
+        dry_run=body.dry_run,
+    )
 
     return BulkSendResponse(
         queued=len(task_ids),

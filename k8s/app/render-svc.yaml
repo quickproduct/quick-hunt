@@ -33,6 +33,10 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 256Mi  # Chrome runs with --disable-dev-shm-usage
+        - name: app-logs
+          hostPath:
+            path: /root/job-automation/backend/logs
+            type: DirectoryOrCreate
       containers:
         - name: render-svc
           image: k3d-jh-registry:5050/jh-render:local
@@ -49,6 +53,8 @@ spec:
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
+            - name: app-logs
+              mountPath: /app/backend/logs
           resources:
             requests:
               memory: "512Mi"

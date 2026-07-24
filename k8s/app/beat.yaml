@@ -39,6 +39,9 @@ spec:
                 name: job-hunter-config
             - secretRef:
                 name: job-hunter-secrets
+          volumeMounts:
+            - name: app-logs
+              mountPath: /app/backend/logs
           resources:
             requests:
               memory: "128Mi"
@@ -46,3 +49,8 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "100m"
+      volumes:
+        - name: app-logs
+          hostPath:
+            path: /root/job-automation/backend/logs
+            type: DirectoryOrCreate

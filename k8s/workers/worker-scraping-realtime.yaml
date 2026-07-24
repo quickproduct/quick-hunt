@@ -41,6 +41,10 @@ spec:
             # /dev/shm; 512Mi bounds the memory-backed tmpfs (counts toward the
             # container limit) and frees headroom for process RSS.
             sizeLimit: 512Mi
+        - name: app-logs
+          hostPath:
+            path: /root/job-automation/backend/logs
+            type: DirectoryOrCreate
       containers:
         - name: worker
           image: k3d-jh-registry:5050/jh-worker-playwright:local
@@ -74,6 +78,8 @@ spec:
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
+            - name: app-logs
+              mountPath: /app/backend/logs
           resources:
             requests:
               memory: "384Mi"

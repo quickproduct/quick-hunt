@@ -35,6 +35,11 @@ spec:
             limits:
               memory: "32Mi"
               cpu: "50m"
+      volumes:
+        - name: app-logs
+          hostPath:
+            path: /root/job-automation/backend/logs
+            type: DirectoryOrCreate
       containers:
         - name: worker
           image: k3d-jh-registry:5050/jh-worker-lightweight:local
@@ -62,6 +67,9 @@ spec:
                 name: job-hunter-config
             - secretRef:
                 name: job-hunter-secrets
+          volumeMounts:
+            - name: app-logs
+              mountPath: /app/backend/logs
           resources:
             requests:
               memory: "128Mi"

@@ -41,6 +41,10 @@ spec:
             # 512Mi is sufficient with asset blocking (images/css/fonts/media
             # aborted via route interception) capping Chromium's SHM footprint.
             sizeLimit: 512Mi
+        - name: app-logs
+          hostPath:
+            path: /root/job-automation/backend/logs
+            type: DirectoryOrCreate
       containers:
         - name: worker
           image: k3d-jh-registry:5050/jh-worker-playwright:local
@@ -71,6 +75,8 @@ spec:
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
+            - name: app-logs
+              mountPath: /app/backend/logs
           resources:
             requests:
               memory: "384Mi"
