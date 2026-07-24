@@ -162,6 +162,7 @@ class SendRequest(BaseModel):
     candidate_id: str
     override_email: Optional[str] = None
     override_subject: Optional[str] = None
+    cover_letter: Optional[str] = None
     attach_resume: bool = True
     dry_run: bool = False
 
@@ -175,7 +176,7 @@ class BulkGenerateCoverRequest(BaseModel):
 
 class SkippedJob(BaseModel):
     job_id: str
-    reason: str  # "no_hr_email" | "no_cover_letter" | "already_sent" | "not_found"
+    reason: str  # "no_hr_email" | "no_cover_letter" | "candidate_mismatch" | "already_sent" | "not_found"
 
 
 class BulkSendRequest(BaseModel):

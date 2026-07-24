@@ -42,6 +42,7 @@ def send_application_email_task(
     candidate_id: str,
     override_email: Optional[str] = None,
     override_subject: Optional[str] = None,
+    cover_letter_override: Optional[str] = None,
     attach_resume: bool = True,
     dry_run: bool = False,
 ) -> dict:
@@ -212,9 +213,20 @@ def send_application_email_task(
 
             subject = override_subject or f"Application for {job.job_title} at {job.company}"
 
+            cover_letter_override = (cover_letter_override or "").strip() or None
+
+            if not cover_letter_override and job.cover_letter and str(job.candidate_id or "") != candidate_id:
+                raise ValueError(
+                    f"Cover letter for job {job_id} belongs to candidate "
+                    f"{job.candidate_id}; selected candidate is {candidate_id}. "
+                    "Generate a fresh cover letter before sending."
+                )
+
             # MNC jobs always use static_cover_letter regardless of PHP/Python flag.
             # Non-PHP jobs also use static_cover_letter — no PHP/Laravel mentions.
-            if (job.source_portal == "mnc_direct" or not job.is_php_python) and candidate.static_cover_letter:
+            if cover_letter_override:
+                cover_letter = cover_letter_override
+            elif (job.source_portal == "mnc_direct" or not job.is_php_python) and candidate.static_cover_letter:
                 cover_letter = candidate.static_cover_letter
             elif job.cover_letter:
                 cover_letter = job.cover_letter

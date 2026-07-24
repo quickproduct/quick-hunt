@@ -170,8 +170,9 @@ export default function ConsultingJobsPage() {
 
     setLoading(true);
     try {
-      const params = buildApiParams(filters);
-      const countParams = buildCountParams(filters);
+      const candidateScope = activeCandidateId ? { candidate_id: activeCandidateId } : {};
+      const params = buildApiParams(filters, candidateScope);
+      const countParams = { ...buildCountParams(filters), ...candidateScope };
       const [data, countData] = await Promise.all([
         getConsultingJobs(params),
         getConsultingJobsCount(countParams),
@@ -185,7 +186,7 @@ export default function ConsultingJobsPage() {
     } finally {
       setLoading(false);
     }
-  }, [filters]);
+  }, [filters, activeCandidateId]);
 
   useEffect(() => { fetchJobs(); }, [fetchJobs]);
 
@@ -241,7 +242,10 @@ export default function ConsultingJobsPage() {
 
   const getEffectiveIds = async (): Promise<string[]> => {
     if (!selectAllMatching) return [...selected];
-    return getConsultingJobIds(buildCountParams(filters));
+    return getConsultingJobIds({
+      ...buildCountParams(filters),
+      ...(activeCandidateId ? { candidate_id: activeCandidateId } : {}),
+    });
   };
 
   // ── Sorting ──────────────────────────────────────────────────────────────
@@ -273,7 +277,13 @@ export default function ConsultingJobsPage() {
     const ids = await getEffectiveIds();
     const selectedJobs = jobs.filter(j => ids.includes(j.id));
     if (selectAllMatching) {
-      const allJobs = await getJobs({ ...buildApiParams(filters), page: 1, page_size: Math.min(totalCount, 100), consulting_only: true });
+      const allJobs = await getJobs({
+        ...buildApiParams(filters),
+        ...(activeCandidateId ? { candidate_id: activeCandidateId } : {}),
+        page: 1,
+        page_size: Math.min(totalCount, 100),
+        consulting_only: true,
+      });
       setBulkModalJobs(allJobs);
     } else {
       setBulkModalJobs(selectedJobs);

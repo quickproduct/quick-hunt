@@ -45,10 +45,18 @@ async def send_application(
             detail="Job has no HR email. Run email discovery first or provide override_email.",
         )
 
-    if not job.cover_letter and not body.dry_run:
+    cover_letter = (body.cover_letter or "").strip() or None
+
+    if not cover_letter and not job.cover_letter and not body.dry_run:
         raise HTTPException(
             status_code=422,
             detail="Job has no cover letter. Generate one first with POST /jobs/{id}/generate_cover.",
+        )
+
+    if not cover_letter and job.cover_letter and str(job.candidate_id or "") != body.candidate_id:
+        raise HTTPException(
+            status_code=422,
+            detail="This cover letter was generated for a different candidate. Generate a new cover letter for the selected candidate before sending.",
         )
 
     # Block only if THIS candidate already sent to this job — not if a different candidate did.
@@ -71,8 +79,9 @@ async def send_application(
 
     if body.dry_run:
         from services.sender.template import render_html, render_plain
-        html = render_html(job.cover_letter or "Sample cover letter", candidate, job)
-        plain = render_plain(job.cover_letter or "Sample cover letter", candidate, job)
+        preview_cover = cover_letter or job.cover_letter or "Sample cover letter"
+        html = render_html(preview_cover, candidate, job)
+        plain = render_plain(preview_cover, candidate, job)
         return {
             "dry_run": True,
             "to_email": to_email,
@@ -88,6 +97,7 @@ async def send_application(
             "candidate_id": body.candidate_id,
             "override_email": body.override_email,
             "override_subject": body.override_subject,
+            "cover_letter_override": cover_letter,
             "attach_resume": body.attach_resume,
             "dry_run": False,
         },

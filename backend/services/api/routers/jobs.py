@@ -63,8 +63,11 @@ def _apply_job_filters(
     posted_after: Optional[str] = None,
     mnc_only: Optional[bool] = None,
     consulting_only: Optional[bool] = None,
+    candidate_id: Optional[str] = None,
 ):
     """Apply all common where-clause filters to a job query."""
+    if candidate_id:
+        q = q.where(Job.candidate_id == candidate_id)
     if status:
         q = q.where(Job.status == status)
     if portal:
@@ -189,6 +192,7 @@ async def list_jobs(
     posted_after: Optional[str] = Query(None, description="ISO date string, e.g. 2026-04-10"),
     mnc_only: Optional[bool] = Query(None, description="true=MNC jobs only, false=exclude MNC jobs"),
     consulting_only: Optional[bool] = Query(None, description="true=Consulting jobs only, false=exclude Consulting jobs"),
+    candidate_id: Optional[str] = Query(None, description="Only jobs for this candidate"),
     # sorting
     sort_by: str = Query(default="scraped_at", pattern="^(scraped_at|relevance_score|company|job_title)$"),
     sort_dir: str = Query(default="desc", pattern="^(asc|desc)$"),
@@ -201,6 +205,7 @@ async def list_jobs(
         min_score=min_score, search=search, max_score=max_score, has_cover=has_cover,
         job_type=job_type, has_active_send=has_active_send, scraped_after=scraped_after,
         posted_after=posted_after, mnc_only=mnc_only, consulting_only=consulting_only,
+        candidate_id=candidate_id,
         sort_by=sort_by, sort_dir=sort_dir,
         page=page, page_size=page_size,
     )
@@ -225,6 +230,7 @@ async def list_jobs(
         posted_after=posted_after,
         mnc_only=mnc_only,
         consulting_only=consulting_only,
+        candidate_id=candidate_id,
     )
     sort_col = {
         "scraped_at": Job.scraped_at,
@@ -260,12 +266,14 @@ async def count_jobs(
     posted_after: Optional[str] = Query(None),
     mnc_only: Optional[bool] = Query(None),
     consulting_only: Optional[bool] = Query(None),
+    candidate_id: Optional[str] = Query(None),
 ) -> dict:
     cache_key = _count_cache_key(
         status=status, portal=portal, company=company, has_hr_email=has_hr_email,
         min_score=min_score, search=search, max_score=max_score, has_cover=has_cover,
         job_type=job_type, has_active_send=has_active_send, scraped_after=scraped_after,
         posted_after=posted_after, mnc_only=mnc_only, consulting_only=consulting_only,
+        candidate_id=candidate_id,
     )
     cached = await cache_get(cache_key)
     if cached is not None:
@@ -288,6 +296,7 @@ async def count_jobs(
         posted_after=posted_after,
         mnc_only=mnc_only,
         consulting_only=consulting_only,
+        candidate_id=candidate_id,
     )
     result = await db.execute(q)
     data = {"count": result.scalar_one()}
@@ -315,6 +324,7 @@ async def list_job_ids(
     posted_after: Optional[str] = Query(None),
     mnc_only: Optional[bool] = Query(None),
     consulting_only: Optional[bool] = Query(None),
+    candidate_id: Optional[str] = Query(None),
 ) -> list[str]:
     """Return all matching job IDs for the given filters (no pagination cap).
 
@@ -339,6 +349,7 @@ async def list_job_ids(
         posted_after=posted_after,
         mnc_only=mnc_only,
         consulting_only=consulting_only,
+        candidate_id=candidate_id,
     )
     q = q.limit(5000)
     result = await db.execute(q)
@@ -548,7 +559,7 @@ async def bulk_send(
 
     # Fetch all requested jobs in one IN query instead of N individual GETs
     jobs_result = await db.execute(
-        select(Job.id, Job.hr_email, Job.cover_letter, Job.status).where(
+        select(Job.id, Job.hr_email, Job.cover_letter, Job.status, Job.candidate_id).where(
             Job.id.in_(body.job_ids)
         )
     )
@@ -579,6 +590,9 @@ async def bulk_send(
             continue
         if not job.hr_email:
             skipped.append(SkippedJob(job_id=job_id, reason="no_hr_email"))
+            continue
+        if job.cover_letter and str(job.candidate_id or "") != body.candidate_id:
+            skipped.append(SkippedJob(job_id=job_id, reason="candidate_mismatch"))
             continue
         if not job.cover_letter and not body.dry_run:
             skipped.append(SkippedJob(job_id=job_id, reason="no_cover_letter"))

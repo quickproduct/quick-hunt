@@ -16,6 +16,7 @@ interface BulkSendModalProps {
 const SKIP_REASON_LABELS: Record<string, string> = {
   no_hr_email: 'No HR email',
   no_cover_letter: 'No cover letter',
+  candidate_mismatch: 'Wrong candidate cover',
   already_sent: 'Already sent',
   not_found: 'Not found',
 };

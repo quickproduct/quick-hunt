@@ -170,8 +170,9 @@ export default function MNCJobsPage() {
 
     setLoading(true);
     try {
-      const params = buildApiParams(filters);
-      const countParams = buildCountParams(filters);
+      const candidateScope = activeCandidateId ? { candidate_id: activeCandidateId } : {};
+      const params = buildApiParams(filters, candidateScope);
+      const countParams = { ...buildCountParams(filters), ...candidateScope };
       const [data, countData] = await Promise.all([
         getMncJobs(params),
         getMncJobsCount(countParams),
@@ -185,7 +186,7 @@ export default function MNCJobsPage() {
     } finally {
       setLoading(false);
     }
-  }, [filters]);
+  }, [filters, activeCandidateId]);
 
   useEffect(() => { fetchJobs(); }, [fetchJobs]);
 
@@ -241,7 +242,10 @@ export default function MNCJobsPage() {
 
   const getEffectiveIds = async (): Promise<string[]> => {
     if (!selectAllMatching) return [...selected];
-    return getMncJobIds(buildCountParams(filters));
+    return getMncJobIds({
+      ...buildCountParams(filters),
+      ...(activeCandidateId ? { candidate_id: activeCandidateId } : {}),
+    });
   };
 
   // ── Sorting ──────────────────────────────────────────────────────────────
@@ -273,7 +277,13 @@ export default function MNCJobsPage() {
     const ids = await getEffectiveIds();
     const selectedJobs = jobs.filter(j => ids.includes(j.id));
     if (selectAllMatching) {
-      const allJobs = await getJobs({ ...buildApiParams(filters), page: 1, page_size: Math.min(totalCount, 100), mnc_only: true });
+      const allJobs = await getJobs({
+        ...buildApiParams(filters),
+        ...(activeCandidateId ? { candidate_id: activeCandidateId } : {}),
+        page: 1,
+        page_size: Math.min(totalCount, 100),
+        mnc_only: true,
+      });
       setBulkModalJobs(allJobs);
     } else {
       setBulkModalJobs(selectedJobs);

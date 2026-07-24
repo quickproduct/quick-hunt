@@ -150,7 +150,7 @@ async def generate_cover_node(state: ApplicationWorkflowState, config: RunnableC
     )
 
     # Save generated cover letter to DB
-    await _update_job_cover_letter(state["job_id"], result.full_text)
+    await _update_job_cover_letter(state["job_id"], result.full_text, state["candidate_id"])
 
     logger.info("generate_cover_node_complete", job_id=state["job_id"])
     return {"cover_letter": result.full_text}
@@ -313,7 +313,7 @@ async def _update_job_score(job_id: str, score) -> None:
         await session.commit()
 
 
-async def _update_job_cover_letter(job_id: str, cover_text: str) -> None:
+async def _update_job_cover_letter(job_id: str, cover_text: str, candidate_id: str) -> None:
     from datetime import datetime, timezone
     from sqlalchemy import update
     from services.api.core.database import get_worker_session_factory
@@ -326,6 +326,7 @@ async def _update_job_cover_letter(job_id: str, cover_text: str) -> None:
             .where(Job.id == job_id)
             .values(
                 cover_letter=cover_text,
+                candidate_id=candidate_id,
                 cover_letter_generated_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 status="cover_generated",
             )

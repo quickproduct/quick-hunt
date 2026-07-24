@@ -364,6 +364,7 @@ def generate_cover_letter_task(
             cover_letter = await _fill_cover_letter(job, candidate, callbacks=callbacks)
 
             job.cover_letter = cover_letter
+            job.candidate_id = candidate.id
             job.cover_letter_generated_at = datetime.now(timezone.utc).replace(tzinfo=None)
             if job.status in ("new", "filtered", "scoring"):
                 job.status = "cover_generated"
@@ -574,7 +575,7 @@ def refresh_cover_letters_task() -> dict:
                           j.job_description, j.job_url, j.source_portal) for j in jobs]
 
         async def _process_one(job_id, candidate_id, job_title, company,
-                               job_description, job_url, source_portal) -> tuple[str, str | None]:
+                               job_description, job_url, source_portal) -> tuple[str, str | None, str | None]:
             candidate = candidates.get(candidate_id) if candidate_id else None
             if not candidate:
                 candidate = fallback_candidate
@@ -585,12 +586,12 @@ def refresh_cover_letters_task() -> dict:
                 async with _sf() as _s:
                     job = await _s.get(_Job, job_id)
                     if not job:
-                        return job_id, None
+                        return job_id, None, None
                     cover = await _fill_cover_letter(job, candidate)
-                    return job_id, cover
+                    return job_id, cover, candidate.id
             except Exception as e:
                 log_exception(logger, "refresh_single_job_failed", e, job_id=job_id)
-                return job_id, None
+                return job_id, None, None
 
         results = await _asyncio.gather(*[_process_one(*jd) for jd in job_data])
 
@@ -598,7 +599,7 @@ def refresh_cover_letters_task() -> dict:
         from sqlalchemy import bindparam, update as sa_update
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        success_pairs = [(jid, c) for jid, c in results if c]
+        success_pairs = [(jid, c, cid) for jid, c, cid in results if c and cid]
         skipped = len(results) - len(success_pairs)
         refreshed = 0
 
@@ -610,13 +611,17 @@ def refresh_cover_letters_task() -> dict:
                         .where(Job.__table__.c.id == bindparam("_id"))
                         .values(
                             cover_letter=bindparam("_cover"),
+                            candidate_id=bindparam("_candidate_id"),
                             cover_letter_generated_at=bindparam("_ts"),
                         ),
-                        [{"_id": jid, "_cover": c, "_ts": now} for jid, c in success_pairs],
+                        [
+                            {"_id": jid, "_cover": c, "_candidate_id": cid, "_ts": now}
+                            for jid, c, cid in success_pairs
+                        ],
                     )
                     await session.execute(
                         sa_update(Job.__table__)
-                        .where(Job.__table__.c.id.in_([jid for jid, _ in success_pairs]))
+                        .where(Job.__table__.c.id.in_([jid for jid, _, _ in success_pairs]))
                         .where(Job.__table__.c.status.in_(["new", "filtered", "scoring"]))
                         .values(status="cover_generated"),
                     )
@@ -715,6 +720,7 @@ def refresh_non_php_covers_task(self) -> dict:
                             .where(_Job.id == job_id)
                             .values(
                                 cover_letter=new_cover,
+                                candidate_id=candidate.id,
                                 cover_letter_generated_at=now,
                             )
                         )
@@ -817,7 +823,7 @@ def fill_missing_covers_task() -> dict:
                           j.job_description, j.job_url, j.source_portal) for j in jobs]
 
         async def _process_one(job_id, candidate_id, job_title, company,
-                               job_description, job_url, source_portal) -> tuple[str, str | None]:
+                               job_description, job_url, source_portal) -> tuple[str, str | None, str | None]:
             candidate = candidates.get(candidate_id) if candidate_id else None
             if not candidate:
                 candidate = fallback_candidate
@@ -828,12 +834,12 @@ def fill_missing_covers_task() -> dict:
                 async with _sf() as _s:
                     job = await _s.get(_Job, job_id)
                     if not job:
-                        return job_id, None
+                        return job_id, None, None
                     cover = await _fill_cover_letter(job, candidate)
-                    return job_id, cover
+                    return job_id, cover, candidate.id
             except Exception as e:
                 log_exception(logger, "fill_cover_failed", e, job_id=job_id)
-                return job_id, None
+                return job_id, None, None
 
         results = await _asyncio.gather(*[_process_one(*jd) for jd in job_data])
 
@@ -841,7 +847,7 @@ def fill_missing_covers_task() -> dict:
         from sqlalchemy import bindparam, update as sa_update
 
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        success_pairs = [(jid, c) for jid, c in results if c]
+        success_pairs = [(jid, c, cid) for jid, c, cid in results if c and cid]
         skipped = len(results) - len(success_pairs)
         filled = 0
 
@@ -853,13 +859,17 @@ def fill_missing_covers_task() -> dict:
                         .where(Job.__table__.c.id == bindparam("_id"))
                         .values(
                             cover_letter=bindparam("_cover"),
+                            candidate_id=bindparam("_candidate_id"),
                             cover_letter_generated_at=bindparam("_ts"),
                         ),
-                        [{"_id": jid, "_cover": c, "_ts": now} for jid, c in success_pairs],
+                        [
+                            {"_id": jid, "_cover": c, "_candidate_id": cid, "_ts": now}
+                            for jid, c, cid in success_pairs
+                        ],
                     )
                     await session.execute(
                         sa_update(Job.__table__)
-                        .where(Job.__table__.c.id.in_([jid for jid, _ in success_pairs]))
+                        .where(Job.__table__.c.id.in_([jid for jid, _, _ in success_pairs]))
                         .where(Job.__table__.c.status.in_(["new", "filtered", "scoring"]))
                         .values(status="cover_generated"),
                     )
@@ -1261,6 +1271,7 @@ async def _generate_and_save_cover(job_id: str, candidate_id: str) -> dict:
         cover = await _fill_cover_letter(job, candidate, callbacks=callbacks)
 
         job.cover_letter = cover
+        job.candidate_id = candidate.id
         job.cover_letter_generated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         if job.status in ("new", "filtered", "scoring"):
             job.status = "cover_generated"

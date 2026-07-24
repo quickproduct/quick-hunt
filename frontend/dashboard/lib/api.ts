@@ -147,7 +147,7 @@ export interface Job {
 
 export interface SkippedJob {
   job_id: string;
-  reason: 'no_hr_email' | 'no_cover_letter' | 'already_sent' | 'not_found';
+  reason: 'no_hr_email' | 'no_cover_letter' | 'candidate_mismatch' | 'already_sent' | 'not_found';
 }
 
 export interface BulkSendResult {

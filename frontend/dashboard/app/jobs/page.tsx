@@ -195,8 +195,9 @@ export default function JobsPage() {
 
     setLoading(true);
     try {
-      const params = buildApiParams(filters);
-      const countParams = buildCountParams(filters);
+      const candidateScope = activeCandidateId ? { candidate_id: activeCandidateId } : {};
+      const params = buildApiParams(filters, candidateScope);
+      const countParams = { ...buildCountParams(filters), ...candidateScope };
       const [data, countData] = await Promise.all([
         getJobs(params, controller.signal),
         getJobsCount(countParams, controller.signal),
@@ -211,7 +212,7 @@ export default function JobsPage() {
     } finally {
       setLoading(false);
     }
-  }, [filters]);
+  }, [filters, activeCandidateId]);
 
   useEffect(() => { fetchJobs(); }, [fetchJobs]);
 
@@ -267,7 +268,10 @@ export default function JobsPage() {
   const getEffectiveIds = async (): Promise<string[]> => {
     if (!selectAllMatching) return [...selected];
     // Use /jobs/ids which has no page_size cap (returns up to 5000 IDs)
-    return getJobIds(buildCountParams(filters));
+    return getJobIds({
+      ...buildCountParams(filters),
+      ...(activeCandidateId ? { candidate_id: activeCandidateId } : {}),
+    });
   };
 
   // ── Sorting ──────────────────────────────────────────────────────────────
@@ -337,7 +341,12 @@ export default function JobsPage() {
     // If selectAllMatching, some jobs may not be on current page — fetch them
     if (selectAllMatching) {
       // ids already fetched above — filter jobs on current page + re-fetch full list
-      const allJobs = await getJobs({ ...buildApiParams(filters), page: 1, page_size: Math.min(totalCount, 100) });
+      const allJobs = await getJobs({
+        ...buildApiParams(filters),
+        ...(activeCandidateId ? { candidate_id: activeCandidateId } : {}),
+        page: 1,
+        page_size: Math.min(totalCount, 100),
+      });
       setBulkModalJobs(allJobs);
     } else {
       setBulkModalJobs(selectedJobs);
