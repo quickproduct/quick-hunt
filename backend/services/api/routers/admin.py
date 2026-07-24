@@ -1849,14 +1849,14 @@ async def db_migrations(_: Auth):
 
     try:
         result = subprocess.run(
-            ["alembic", "current"],
+            ["alembic", "-c", str(alembic_ini), "current"],
             cwd=str(project_root),
             capture_output=True, text=True, timeout=10,
         )
         current = result.stdout.strip() or result.stderr.strip()
 
         result_pending = subprocess.run(
-            ["alembic", "heads"],
+            ["alembic", "-c", str(alembic_ini), "heads"],
             cwd=str(project_root),
             capture_output=True, text=True, timeout=10,
         )
