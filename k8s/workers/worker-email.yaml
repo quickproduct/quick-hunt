@@ -61,6 +61,8 @@ spec:
           env:
             - name: SERVICE_NAME
               value: "worker-email"
+            - name: LOG_LEVEL
+              value: "INFO"
           envFrom:
             - configMapRef:
                 name: job-hunter-config
