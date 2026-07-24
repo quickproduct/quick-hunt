@@ -7,7 +7,7 @@ data:
   # --- Environment ---
   ENVIRONMENT: "production"
   LOG_LEVEL: "WARNING"
-  LOG_TO_FILE: "false"
+  LOG_TO_FILE: "true"
   OTEL_SDK_DISABLED: "true"
   # Cap glibc malloc arenas. Default is 8 × CPU cores, which fragments heap memory
   # in multi-threaded Python workers (esp. the lxml/bs4 parsing in scraping +

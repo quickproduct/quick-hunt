@@ -31,6 +31,130 @@ _ACTIVE_SEND_STATUSES = frozenset({
 
 
 @celery_app.task(
+    name="services.sender.tasks.send_direct_hr_email_task",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=120,
+)
+def send_direct_hr_email_task(
+    self,
+    candidate_id: str,
+    hr_email: str,
+    tenant_id: str,
+) -> dict:
+    """Send a static candidate application to one HR email address."""
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        task_id=self.request.id,
+        task_name=self.name,
+        worker_id=self.request.hostname,
+    )
+
+    normalized_email = hr_email.strip().lower()
+    logger.info(
+        "direct_send_task_started",
+        candidate_id=candidate_id,
+        hr_email=normalized_email,
+        tenant_id=tenant_id,
+    )
+
+    async def _run():
+        from sqlalchemy import select
+
+        from services.api.core.database import get_worker_session_factory
+        from services.api.models.db import Candidate, DirectSendLog
+        from services.sender.email_adapter import EmailPayload, get_email_adapter
+        from services.sender.resume_fetcher import download_resume
+        from services.sender.template import render_html, render_plain
+
+        session_factory = get_worker_session_factory()
+        async with session_factory() as session:
+            candidate = await session.get(Candidate, candidate_id)
+            if not candidate:
+                raise ValueError(f"Candidate {candidate_id} not found")
+            if not candidate.static_cover_letter:
+                raise ValueError(f"Candidate {candidate_id} has no static cover letter")
+            if not normalized_email:
+                raise ValueError("HR email is empty")
+
+            existing = await session.execute(
+                select(DirectSendLog.id)
+                .where(
+                    DirectSendLog.tenant_id == tenant_id,
+                    DirectSendLog.candidate_id == candidate_id,
+                    DirectSendLog.hr_email == normalized_email,
+                )
+                .limit(1)
+            )
+            if existing.first():
+                logger.info(
+                    "direct_send_task_skipped_duplicate",
+                    candidate_id=candidate_id,
+                    hr_email=normalized_email,
+                    tenant_id=tenant_id,
+                )
+                return {"status": "skipped", "reason": "already_sent", "hr_email": normalized_email}
+
+            html_body = render_html(candidate.static_cover_letter, candidate, None)
+            plain_body = render_plain(candidate.static_cover_letter, candidate, None)
+
+            resume_bytes: Optional[bytes] = None
+            if candidate.resume_url:
+                try:
+                    resume_bytes = download_resume(candidate.resume_url)
+                except Exception as exc:
+                    log_exception(
+                        logger,
+                        "direct_send_resume_fetch_failed",
+                        exc,
+                        candidate_id=candidate_id,
+                        hr_email=normalized_email,
+                    )
+
+            payload = EmailPayload(
+                to_email=normalized_email,
+                subject=f"Application from {candidate.name}",
+                html_body=html_body,
+                plain_body=plain_body,
+                from_email=candidate.email,
+                from_name=candidate.name,
+                attachment_bytes=resume_bytes,
+                attachment_filename=f"{candidate.name.replace(' ', '_')}_resume.pdf",
+            )
+
+            message_id = await get_email_adapter().send(payload)
+            session.add(DirectSendLog(
+                tenant_id=tenant_id,
+                candidate_id=candidate_id,
+                hr_email=normalized_email,
+            ))
+            await session.commit()
+
+        logger.info(
+            "direct_send_task_complete",
+            candidate_id=candidate_id,
+            hr_email=normalized_email,
+            message_id=message_id,
+        )
+        return {"status": "sent", "message_id": message_id, "hr_email": normalized_email}
+
+    try:
+        return _run_async(_run())
+    except RuntimeError as exc:
+        if "Brevo error 400" in str(exc) or "Brevo error 422" in str(exc):
+            log_exception(logger, "direct_send_task_failed_permanent", exc, candidate_id=candidate_id, hr_email=normalized_email)
+            raise ValueError(str(exc))
+        log_exception(logger, "direct_send_task_failed", exc, candidate_id=candidate_id, hr_email=normalized_email)
+        raise self.retry(exc=exc)
+    except ValueError as exc:
+        log_exception(logger, "direct_send_task_validation_failed", exc, candidate_id=candidate_id, hr_email=normalized_email)
+        raise
+    except Exception as exc:
+        log_exception(logger, "direct_send_task_failed", exc, candidate_id=candidate_id, hr_email=normalized_email)
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(
     name="services.sender.tasks.send_application_email_task",
     bind=True,
     max_retries=3,

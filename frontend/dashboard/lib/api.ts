@@ -367,9 +367,21 @@ export const downloadResumeUrl = (id: string) => `/api/candidates/${id}/resume`;
 export const directHRSend = (
   candidateId: string,
   hrEmails: string[]
-): Promise<{ sent: number; failed: string[]; skipped: string[] }> =>
+): Promise<{
+  sent: number;
+  queued: number;
+  failed: string[];
+  skipped: string[];
+  celery_task_ids: string[];
+}> =>
   apiClient
-    .post<{ sent: number; failed: string[]; skipped: string[] }>('/direct-send', {
+    .post<{
+      sent: number;
+      queued: number;
+      failed: string[];
+      skipped: string[];
+      celery_task_ids: string[];
+    }>('/direct-send', {
       candidate_id: candidateId,
       hr_emails: hrEmails,
     })

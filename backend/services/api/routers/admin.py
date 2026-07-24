@@ -1726,13 +1726,14 @@ async def db_tables(_: Auth, db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text as sa_text
     from services.api.models.db import (
         Job, Candidate, SendLog, CronRun, SearchTask,
-        Embedding, BlacklistedCompany, User, Tenant,
+        Embedding, BlacklistedCompany, DirectSendLog, User, Tenant,
     )
 
     tables = {
         "jobs": Job.__tablename__,
         "candidates": Candidate.__tablename__,
         "send_logs": SendLog.__tablename__,
+        "direct_send_logs": DirectSendLog.__tablename__,
         "cron_runs": CronRun.__tablename__,
         "search_tasks": SearchTask.__tablename__,
         "embeddings": Embedding.__tablename__,
@@ -2116,14 +2117,24 @@ async def system_env_check(_: Auth):
         ("DATABASE_URL", "Database connection"),
         ("REDIS_URL", "Redis connection"),
         ("GROQ_API_KEY", "Groq LLM API"),
-        ("RESEND_API_KEY", "Email sending (Resend)"),
+        ("EMAIL_PROVIDER", "Email provider"),
         ("SECRET_KEY", "JWT secret"),
     ]
+
+    email_provider = os.environ.get("EMAIL_PROVIDER", "").lower()
+    if email_provider == "brevo":
+        required_vars.append(("BREVO_API_KEY", "Email sending (Brevo)"))
+        required_vars.append(("BREVO_FROM_EMAIL", "Brevo sender address"))
+    elif email_provider == "smtp":
+        required_vars.append(("SMTP_HOST", "SMTP host"))
+        required_vars.append(("SMTP_USER", "SMTP username"))
+        required_vars.append(("SMTP_PASS", "SMTP password"))
 
     optional_vars = [
         ("RABBITMQ_URL", "RabbitMQ broker"),
         ("CLOUDFLARE_R2_*", "File storage"),
         ("PINECONE_API_KEY", "Vector DB"),
+        ("BREVO_WEBHOOK_SECRET", "Brevo webhook verification"),
     ]
 
     def check_var(name: str) -> dict:
@@ -2728,6 +2739,72 @@ async def admin_send_logs(
             "source_portal": r.source_portal,
         }
         for r in rows
+    ]
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/direct-send-logs")
+async def admin_direct_send_logs(
+    _: Auth,
+    db: AsyncSession = Depends(get_db),
+    candidate_id: Optional[str] = Query(None),
+    hr_email: Optional[str] = Query(None),
+    sent_after: Optional[str] = Query(None, description="ISO date string e.g. 2024-01-01"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Direct HR send log query for operator use."""
+    from datetime import datetime
+    from sqlalchemy import func as sa_func
+    from services.api.models.db import Candidate, DirectSendLog
+
+    conditions = []
+    if candidate_id:
+        conditions.append(DirectSendLog.candidate_id == candidate_id)
+    if hr_email:
+        conditions.append(DirectSendLog.hr_email == hr_email.strip().lower())
+    if sent_after:
+        try:
+            since = datetime.fromisoformat(sent_after)
+            conditions.append(DirectSendLog.sent_at >= since)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid sent_after format, use ISO date")
+
+    count_q = select(sa_func.count(DirectSendLog.id))
+    for condition in conditions:
+        count_q = count_q.where(condition)
+    total = (await db.execute(count_q)).scalar() or 0
+
+    q = (
+        select(
+            DirectSendLog.id,
+            DirectSendLog.tenant_id,
+            DirectSendLog.candidate_id,
+            DirectSendLog.hr_email,
+            DirectSendLog.sent_at,
+            Candidate.name.label("candidate_name"),
+            Candidate.email.label("candidate_email"),
+        )
+        .join(Candidate, DirectSendLog.candidate_id == Candidate.id)
+        .order_by(desc(DirectSendLog.sent_at))
+        .offset(offset)
+        .limit(limit)
+    )
+    for condition in conditions:
+        q = q.where(condition)
+
+    rows = (await db.execute(q)).fetchall()
+    items = [
+        {
+            "id": str(row.id),
+            "tenant_id": str(row.tenant_id),
+            "candidate_id": str(row.candidate_id),
+            "candidate_name": row.candidate_name,
+            "candidate_email": row.candidate_email,
+            "hr_email": row.hr_email,
+            "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+        }
+        for row in rows
     ]
     return {"items": items, "total": total, "limit": limit, "offset": offset}
 

@@ -115,15 +115,17 @@ class DirectSendRequest(BaseModel):
 
 class DirectSendResult(BaseModel):
     sent: int
+    queued: int = 0
     failed: list[str]
     skipped: list[str] = []
+    celery_task_ids: list[str] = []
 
 
 @router.post("/direct-send", response_model=DirectSendResult)
 async def direct_hr_send(
     body: DirectSendRequest, current_user: Auth, db: AsyncSession = Depends(get_db)
 ):
-    """Send resume + static cover letter directly to a list of HR email addresses."""
+    """Queue resume + static cover letter sends for a list of HR email addresses."""
     candidate = await db.get(Candidate, body.candidate_id)
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
@@ -134,7 +136,7 @@ async def direct_hr_send(
             detail="Candidate has no static cover letter. Add one in the Candidates page first.",
         )
 
-    hr_emails = [e.strip().lower() for e in body.hr_emails if e.strip()]
+    hr_emails = list(dict.fromkeys(e.strip().lower() for e in body.hr_emails if e.strip()))
     if not hr_emails:
         raise HTTPException(status_code=422, detail="No HR email addresses provided")
 
@@ -150,56 +152,42 @@ async def direct_hr_send(
     emails_to_send = [e for e in hr_emails if e not in already_sent_set]
     skipped = list(already_sent_set & set(hr_emails))
 
-    if not emails_to_send:
-        return DirectSendResult(sent=0, failed=[], skipped=skipped)
-
-    from services.sender.template import render_html, render_plain
-    from services.sender.email_adapter import EmailPayload, get_email_adapter
-    from services.sender.resume_fetcher import download_resume as fetch_resume
-
-    html_body = render_html(candidate.static_cover_letter, candidate, None)
-    plain_body = render_plain(candidate.static_cover_letter, candidate, None)
-    subject = f"Application from {candidate.name}"
-
-    attachment_bytes: Optional[bytes] = None
-    if candidate.resume_url:
-        try:
-            attachment_bytes = fetch_resume(candidate.resume_url)
-        except Exception as exc:
-            logger.warning("resume_fetch_failed_direct_send", error=str(exc))
-            attachment_bytes = None
-
-    safe_name = candidate.name.lower().replace(" ", "-")
-    attachment_filename = f"{safe_name}-resume.pdf"
-
-    adapter = get_email_adapter()
-    sent_count = 0
+    task_ids: list[str] = []
     failed: list[str] = []
 
     for hr_email in emails_to_send:
-        payload = EmailPayload(
-            to_email=hr_email,
-            subject=subject,
-            html_body=html_body,
-            plain_body=plain_body,
-            from_email=candidate.email,
-            from_name=candidate.name,
-            attachment_bytes=attachment_bytes,
-            attachment_filename=attachment_filename,
-        )
         try:
-            await adapter.send(payload)
-            db.add(DirectSendLog(
-                tenant_id=tenant_id,
+            task = celery_app.send_task(
+                "services.sender.tasks.send_direct_hr_email_task",
+                args=[body.candidate_id, hr_email, tenant_id],
+                queue="jh_email_send",
+                ignore_result=True,
+            )
+            task_ids.append(task.id)
+        except Exception as exc:
+            logger.warning(
+                "direct_send_queue_failed",
                 candidate_id=body.candidate_id,
                 hr_email=hr_email,
-            ))
-            sent_count += 1
-        except Exception as exc:
+                error=str(exc),
+            )
             failed.append(f"{hr_email}: {str(exc)[:100]}")
 
-    await db.commit()
-    return DirectSendResult(sent=sent_count, failed=failed, skipped=skipped)
+    logger.info(
+        "direct_send_queued",
+        candidate_id=body.candidate_id,
+        tenant_id=tenant_id,
+        queued=len(task_ids),
+        failed=len(failed),
+        skipped=len(skipped),
+    )
+    return DirectSendResult(
+        sent=0,
+        queued=len(task_ids),
+        failed=failed,
+        skipped=skipped,
+        celery_task_ids=task_ids,
+    )
 
 
 @router.get("/jobs/send_logs", response_model=list[SendLogEnrichedOut])

@@ -198,6 +198,7 @@ celery_app.conf.update(
         "services.ai.tasks.flush_cover_batch_task":               {"queue": "jh_cover_letter_batch"},
         # ── Email (Redis) ─────────────────────────────────────────────────────
         "services.sender.tasks.send_application_email_task":      {"queue": "jh_email_send"},
+        "services.sender.tasks.send_direct_hr_email_task":        {"queue": "jh_email_send"},
         "services.sender.tasks.retry_failed_sends_task":          {"queue": "jh_email_retry"},
         "services.sender.tasks.dispatch_ready_to_send_task":      {"queue": "jh_email_send"},
         "services.sender.tasks.auto_approve_pending_jobs_task":   {"queue": "jh_email_send"},

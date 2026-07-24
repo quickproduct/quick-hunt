@@ -96,6 +96,61 @@ async def test_send_without_hr_email_returns_422(async_client):
 
 
 @pytest.mark.asyncio
+async def test_direct_send_queues_unique_hr_emails(async_client, monkeypatch):
+    """Direct HR Send should enqueue work instead of sending synchronously."""
+    import uuid
+
+    from services.api.routers import send as send_router
+
+    queued = []
+
+    class FakeTask:
+        def __init__(self, task_id: str):
+            self.id = task_id
+
+    def fake_send_task(name, args=None, queue=None, ignore_result=None, **_kwargs):
+        queued.append({
+            "name": name,
+            "args": args,
+            "queue": queue,
+            "ignore_result": ignore_result,
+        })
+        return FakeTask(f"task-{len(queued)}")
+
+    monkeypatch.setattr(send_router.celery_app, "send_task", fake_send_task)
+
+    cand_resp = await async_client.post("/candidates", json={
+        "name": "Direct Send User",
+        "email": f"direct_send_{uuid.uuid4().hex[:6]}@example.com",
+        "skills": ["Python"],
+        "target_roles": ["Engineer"],
+        "static_cover_letter": "Dear Hiring Manager, I am interested.",
+    })
+    assert cand_resp.status_code == 201
+    candidate_id = cand_resp.json()["id"]
+
+    resp = await async_client.post("/direct-send", json={
+        "candidate_id": candidate_id,
+        "hr_emails": ["HR@One.example", "hr@one.example", "talent@two.example"],
+    })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["sent"] == 0
+    assert data["queued"] == 2
+    assert data["failed"] == []
+    assert data["skipped"] == []
+    assert data["celery_task_ids"] == ["task-1", "task-2"]
+    assert [item["name"] for item in queued] == [
+        "services.sender.tasks.send_direct_hr_email_task",
+        "services.sender.tasks.send_direct_hr_email_task",
+    ]
+    assert [item["args"][1] for item in queued] == ["hr@one.example", "talent@two.example"]
+    assert all(item["queue"] == "jh_email_send" for item in queued)
+    assert all(item["ignore_result"] is True for item in queued)
+
+
+@pytest.mark.asyncio
 async def test_stats_returns_expected_shape(async_client):
     """GET /stats should return all required keys."""
     resp = await async_client.get("/stats")

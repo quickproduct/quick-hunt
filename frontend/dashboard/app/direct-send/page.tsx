@@ -11,7 +11,13 @@ export default function DirectHRSendPage() {
   const [candidateId, setCandidateId] = useState('');
   const [hrEmailsRaw, setHrEmailsRaw] = useState('');
   const [sending, setSending] = useState(false);
-  const [result, setResult] = useState<{ sent: number; failed: string[]; skipped: string[] } | null>(null);
+  const [result, setResult] = useState<{
+    sent: number;
+    queued: number;
+    failed: string[];
+    skipped: string[];
+    celery_task_ids: string[];
+  } | null>(null);
 
   useEffect(() => {
     getCandidates()
@@ -49,7 +55,9 @@ export default function DirectHRSendPage() {
     try {
       const res = await directHRSend(candidateId, hrEmails);
       setResult(res);
-      if (res.sent > 0) {
+      if (res.queued > 0) {
+        toast.success(`Queued ${res.queued} HR email${res.queued > 1 ? 's' : ''} for sending`);
+      } else if (res.sent > 0) {
         toast.success(`Sent to ${res.sent} HR email${res.sent > 1 ? 's' : ''} successfully`);
       }
       if (res.failed.length > 0) {
@@ -169,7 +177,7 @@ export default function DirectHRSendPage() {
           <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Send Results</h2>
           <div className="flex gap-6 text-sm">
             <span className="text-green-600 dark:text-green-400 font-medium">
-              ✓ {result.sent} sent
+              {result.queued > 0 ? `✓ ${result.queued} queued` : `✓ ${result.sent} sent`}
             </span>
             {result.failed.length > 0 && (
               <span className="text-red-500 dark:text-red-400 font-medium">
