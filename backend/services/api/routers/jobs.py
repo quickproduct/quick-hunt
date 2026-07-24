@@ -554,7 +554,10 @@ async def bulk_send(
     body: BulkSendRequest, _: Auth, db: AsyncSession = Depends(get_db)
 ):
     from services.api.models.db import SendLog
+    from services.api.core.blacklist_utils import get_blacklisted_names, is_company_blacklisted
+    from services.api.models.hr_email_utils import get_hr_email_status
     from services.sender.tasks import send_application_email_task
+    from services.common.placeholder_emails import is_placeholder_email
 
     candidate = await db.get(Candidate, body.candidate_id)
     if not candidate:
@@ -562,11 +565,18 @@ async def bulk_send(
 
     # Fetch all requested jobs in one IN query instead of N individual GETs
     jobs_result = await db.execute(
-        select(Job.id, Job.hr_email, Job.cover_letter, Job.status, Job.candidate_id).where(
-            Job.id.in_(body.job_ids)
-        )
+        select(
+            Job.id,
+            Job.hr_email,
+            Job.cover_letter,
+            Job.status,
+            Job.candidate_id,
+            Job.company,
+            Job.tenant_id,
+        ).where(Job.id.in_(body.job_ids))
     )
     jobs_map = {row.id: row for row in jobs_result.all()}
+    blacklist = await get_blacklisted_names(db)
 
     # Block re-send if there is ANY active/in-flight send_log for this (job, candidate).
     # This covers: queued, sent, deferred (Brevo retrying), soft_bounced/blocked (our retry
@@ -594,6 +604,17 @@ async def bulk_send(
         if not job.hr_email:
             skipped.append(SkippedJob(job_id=job_id, reason="no_hr_email"))
             continue
+        if is_company_blacklisted(job.company or "", blacklist):
+            skipped.append(SkippedJob(job_id=job_id, reason="company_blacklisted"))
+            continue
+        if is_placeholder_email(job.hr_email):
+            skipped.append(SkippedJob(job_id=job_id, reason="placeholder_email"))
+            continue
+        if job.tenant_id:
+            email_status = await get_hr_email_status(db, str(job.tenant_id), job.hr_email)
+            if email_status and email_status[0] in ("bounced", "invalid", "fake"):
+                skipped.append(SkippedJob(job_id=job_id, reason=f"hr_email_{email_status[0]}"))
+                continue
         if job.cover_letter and str(job.candidate_id or "") != body.candidate_id:
             skipped.append(SkippedJob(job_id=job_id, reason="candidate_mismatch"))
             continue
