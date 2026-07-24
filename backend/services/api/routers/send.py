@@ -1,5 +1,6 @@
 """Send router — email sending and send log listing."""
 import asyncio
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
@@ -13,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.cache import cache_get, cache_set
+from services.api.core.config import get_settings
 from services.api.core.database import get_db
 from services.api.core.dependencies import get_current_user
 from services.api.models.db import Candidate, DirectSendLog, Job, SendLog, User
@@ -141,37 +143,73 @@ async def direct_hr_send(
         raise HTTPException(status_code=422, detail="No HR email addresses provided")
 
     tenant_id = current_user.tenant_id
-    already_sent_rows = await db.scalars(
-        select(DirectSendLog.hr_email).where(
+    existing_rows = await db.scalars(
+        select(DirectSendLog).where(
             DirectSendLog.tenant_id == tenant_id,
             DirectSendLog.candidate_id == body.candidate_id,
             DirectSendLog.hr_email.in_(hr_emails),
         )
     )
-    already_sent_set = set(already_sent_rows.all())
-    emails_to_send = [e for e in hr_emails if e not in already_sent_set]
-    skipped = list(already_sent_set & set(hr_emails))
+    existing_by_email = {row.hr_email: row for row in existing_rows.all()}
+    active_statuses = {"queued", "sending", "sent"}
+    skipped = [
+        email for email in hr_emails
+        if email in existing_by_email and existing_by_email[email].status in active_statuses
+    ]
+    emails_to_send = [email for email in hr_emails if email not in set(skipped)]
 
     task_ids: list[str] = []
     failed: list[str] = []
+    logs_to_enqueue: list[DirectSendLog] = []
+    settings = get_settings()
 
     for hr_email in emails_to_send:
+        existing_log = existing_by_email.get(hr_email)
+        if existing_log:
+            existing_log.status = "queued"
+            existing_log.provider = settings.email_provider
+            existing_log.provider_message_id = None
+            existing_log.celery_task_id = None
+            existing_log.error_message = None
+            existing_log.sent_at = None
+            logs_to_enqueue.append(existing_log)
+            continue
+
+        direct_log = DirectSendLog(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant_id,
+            candidate_id=body.candidate_id,
+            hr_email=hr_email,
+            status="queued",
+            provider=settings.email_provider,
+        )
+        db.add(direct_log)
+        logs_to_enqueue.append(direct_log)
+
+    await db.commit()
+
+    for direct_log in logs_to_enqueue:
         try:
             task = celery_app.send_task(
                 "services.sender.tasks.send_direct_hr_email_task",
-                args=[body.candidate_id, hr_email, tenant_id],
+                args=[direct_log.id],
                 queue="jh_email_send",
                 ignore_result=True,
             )
+            direct_log.celery_task_id = task.id
             task_ids.append(task.id)
         except Exception as exc:
+            direct_log.status = "failed"
+            direct_log.error_message = str(exc)[:1000]
             logger.warning(
                 "direct_send_queue_failed",
                 candidate_id=body.candidate_id,
-                hr_email=hr_email,
+                hr_email=direct_log.hr_email,
                 error=str(exc),
             )
-            failed.append(f"{hr_email}: {str(exc)[:100]}")
+            failed.append(f"{direct_log.hr_email}: {str(exc)[:100]}")
+
+    await db.commit()
 
     logger.info(
         "direct_send_queued",

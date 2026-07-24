@@ -2748,6 +2748,7 @@ async def admin_direct_send_logs(
     _: Auth,
     db: AsyncSession = Depends(get_db),
     candidate_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
     hr_email: Optional[str] = Query(None),
     sent_after: Optional[str] = Query(None, description="ISO date string e.g. 2024-01-01"),
     limit: int = Query(100, ge=1, le=500),
@@ -2761,6 +2762,8 @@ async def admin_direct_send_logs(
     conditions = []
     if candidate_id:
         conditions.append(DirectSendLog.candidate_id == candidate_id)
+    if status:
+        conditions.append(DirectSendLog.status == status)
     if hr_email:
         conditions.append(DirectSendLog.hr_email == hr_email.strip().lower())
     if sent_after:
@@ -2781,7 +2784,14 @@ async def admin_direct_send_logs(
             DirectSendLog.tenant_id,
             DirectSendLog.candidate_id,
             DirectSendLog.hr_email,
+            DirectSendLog.status,
+            DirectSendLog.provider,
+            DirectSendLog.provider_message_id,
+            DirectSendLog.celery_task_id,
+            DirectSendLog.error_message,
+            DirectSendLog.created_at,
             DirectSendLog.sent_at,
+            DirectSendLog.updated_at,
             Candidate.name.label("candidate_name"),
             Candidate.email.label("candidate_email"),
         )
@@ -2802,7 +2812,14 @@ async def admin_direct_send_logs(
             "candidate_name": row.candidate_name,
             "candidate_email": row.candidate_email,
             "hr_email": row.hr_email,
+            "status": row.status,
+            "provider": row.provider,
+            "provider_message_id": row.provider_message_id,
+            "celery_task_id": row.celery_task_id,
+            "error_message": row.error_message,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
             "sent_at": row.sent_at.isoformat() if row.sent_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
         for row in rows
     ]

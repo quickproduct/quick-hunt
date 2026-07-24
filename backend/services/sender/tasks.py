@@ -30,6 +30,32 @@ _ACTIVE_SEND_STATUSES = frozenset({
 })
 
 
+def _mark_direct_send_failed(direct_send_log_id: str, exc: Exception) -> None:
+    """Best-effort status update so direct-send failures stay visible."""
+    async def _run():
+        from services.api.core.database import get_worker_session_factory
+        from services.api.models.db import DirectSendLog
+
+        session_factory = get_worker_session_factory()
+        async with session_factory() as session:
+            direct_log = await session.get(DirectSendLog, direct_send_log_id)
+            if not direct_log or direct_log.status == "sent":
+                return
+            direct_log.status = "failed"
+            direct_log.error_message = str(exc)[:1000]
+            await session.commit()
+
+    try:
+        _run_async(_run())
+    except Exception as mark_exc:
+        log_exception(
+            logger,
+            "direct_send_failed_status_update_failed",
+            mark_exc,
+            direct_send_log_id=direct_send_log_id,
+        )
+
+
 @celery_app.task(
     name="services.sender.tasks.send_direct_hr_email_task",
     bind=True,
@@ -38,9 +64,7 @@ _ACTIVE_SEND_STATUSES = frozenset({
 )
 def send_direct_hr_email_task(
     self,
-    candidate_id: str,
-    hr_email: str,
-    tenant_id: str,
+    direct_send_log_id: str,
 ) -> dict:
     """Send a static candidate application to one HR email address."""
     structlog.contextvars.clear_contextvars()
@@ -50,12 +74,9 @@ def send_direct_hr_email_task(
         worker_id=self.request.hostname,
     )
 
-    normalized_email = hr_email.strip().lower()
     logger.info(
         "direct_send_task_started",
-        candidate_id=candidate_id,
-        hr_email=normalized_email,
-        tenant_id=tenant_id,
+        direct_send_log_id=direct_send_log_id,
     )
 
     async def _run():
@@ -63,12 +84,30 @@ def send_direct_hr_email_task(
 
         from services.api.core.database import get_worker_session_factory
         from services.api.models.db import Candidate, DirectSendLog
+        from services.api.core.config import get_settings
         from services.sender.email_adapter import EmailPayload, get_email_adapter
         from services.sender.resume_fetcher import download_resume
         from services.sender.template import render_html, render_plain
 
         session_factory = get_worker_session_factory()
         async with session_factory() as session:
+            direct_log = await session.get(DirectSendLog, direct_send_log_id)
+            if not direct_log:
+                raise ValueError(f"Direct send log {direct_send_log_id} not found")
+            if direct_log.status == "sent":
+                logger.info(
+                    "direct_send_task_skipped_duplicate",
+                    direct_send_log_id=direct_send_log_id,
+                    hr_email=direct_log.hr_email,
+                )
+                return {"status": "skipped", "reason": "already_sent", "hr_email": direct_log.hr_email}
+
+            direct_log.status = "sending"
+            direct_log.error_message = None
+            await session.flush()
+
+            candidate_id = str(direct_log.candidate_id)
+            normalized_email = direct_log.hr_email.strip().lower()
             candidate = await session.get(Candidate, candidate_id)
             if not candidate:
                 raise ValueError(f"Candidate {candidate_id} not found")
@@ -80,19 +119,26 @@ def send_direct_hr_email_task(
             existing = await session.execute(
                 select(DirectSendLog.id)
                 .where(
-                    DirectSendLog.tenant_id == tenant_id,
+                    DirectSendLog.tenant_id == direct_log.tenant_id,
                     DirectSendLog.candidate_id == candidate_id,
                     DirectSendLog.hr_email == normalized_email,
+                    DirectSendLog.status == "sent",
+                    DirectSendLog.id != direct_send_log_id,
                 )
                 .limit(1)
             )
             if existing.first():
                 logger.info(
                     "direct_send_task_skipped_duplicate",
+                    direct_send_log_id=direct_send_log_id,
                     candidate_id=candidate_id,
                     hr_email=normalized_email,
-                    tenant_id=tenant_id,
+                    tenant_id=str(direct_log.tenant_id),
                 )
+                direct_log.status = "sent"
+                direct_log.error_message = "Skipped duplicate after another direct send completed."
+                direct_log.sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                await session.commit()
                 return {"status": "skipped", "reason": "already_sent", "hr_email": normalized_email}
 
             html_body = render_html(candidate.static_cover_letter, candidate, None)
@@ -123,15 +169,17 @@ def send_direct_hr_email_task(
             )
 
             message_id = await get_email_adapter().send(payload)
-            session.add(DirectSendLog(
-                tenant_id=tenant_id,
-                candidate_id=candidate_id,
-                hr_email=normalized_email,
-            ))
+            settings = get_settings()
+            direct_log.status = "sent"
+            direct_log.provider = settings.email_provider
+            direct_log.provider_message_id = message_id
+            direct_log.sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            direct_log.error_message = None
             await session.commit()
 
         logger.info(
             "direct_send_task_complete",
+            direct_send_log_id=direct_send_log_id,
             candidate_id=candidate_id,
             hr_email=normalized_email,
             message_id=message_id,
@@ -142,15 +190,19 @@ def send_direct_hr_email_task(
         return _run_async(_run())
     except RuntimeError as exc:
         if "Brevo error 400" in str(exc) or "Brevo error 422" in str(exc):
-            log_exception(logger, "direct_send_task_failed_permanent", exc, candidate_id=candidate_id, hr_email=normalized_email)
+            _mark_direct_send_failed(direct_send_log_id, exc)
+            log_exception(logger, "direct_send_task_failed_permanent", exc, direct_send_log_id=direct_send_log_id)
             raise ValueError(str(exc))
-        log_exception(logger, "direct_send_task_failed", exc, candidate_id=candidate_id, hr_email=normalized_email)
+        _mark_direct_send_failed(direct_send_log_id, exc)
+        log_exception(logger, "direct_send_task_failed", exc, direct_send_log_id=direct_send_log_id)
         raise self.retry(exc=exc)
     except ValueError as exc:
-        log_exception(logger, "direct_send_task_validation_failed", exc, candidate_id=candidate_id, hr_email=normalized_email)
+        _mark_direct_send_failed(direct_send_log_id, exc)
+        log_exception(logger, "direct_send_task_validation_failed", exc, direct_send_log_id=direct_send_log_id)
         raise
     except Exception as exc:
-        log_exception(logger, "direct_send_task_failed", exc, candidate_id=candidate_id, hr_email=normalized_email)
+        _mark_direct_send_failed(direct_send_log_id, exc)
+        log_exception(logger, "direct_send_task_failed", exc, direct_send_log_id=direct_send_log_id)
         raise self.retry(exc=exc)
 
 

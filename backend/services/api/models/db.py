@@ -316,12 +316,21 @@ class DirectSendLog(Base):
                           default=lambda: SENTINEL_TENANT_ID)
     candidate_id = Column(String(36), ForeignKey("candidates.id"), nullable=False)
     hr_email     = Column(String(300), nullable=False)
-    sent_at      = Column(DateTime, server_default=func.now())
+    status       = Column(String(30), default="queued", nullable=False)
+    provider     = Column(String(30), nullable=True)
+    provider_message_id = Column(String(200), nullable=True)
+    celery_task_id = Column(String(200), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at   = Column(DateTime, server_default=func.now())
+    sent_at      = Column(DateTime, nullable=True)
+    updated_at   = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "candidate_id", "hr_email",
                          name="uq_direct_send_tenant_candidate_email"),
         Index("ix_direct_send_logs_tenant_candidate", "tenant_id", "candidate_id"),
+        Index("ix_direct_send_logs_status", "status"),
+        Index("ix_direct_send_logs_celery_task_id", "celery_task_id"),
     )
 
 

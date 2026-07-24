@@ -145,9 +145,16 @@ async def test_direct_send_queues_unique_hr_emails(async_client, monkeypatch):
         "services.sender.tasks.send_direct_hr_email_task",
         "services.sender.tasks.send_direct_hr_email_task",
     ]
-    assert [item["args"][1] for item in queued] == ["hr@one.example", "talent@two.example"]
+    assert all(len(item["args"]) == 1 for item in queued)
     assert all(item["queue"] == "jh_email_send" for item in queued)
     assert all(item["ignore_result"] is True for item in queued)
+
+    logs_resp = await async_client.get(f"/admin/direct-send-logs?candidate_id={candidate_id}")
+    assert logs_resp.status_code == 200
+    logs = logs_resp.json()
+    assert logs["total"] == 2
+    assert {item["hr_email"] for item in logs["items"]} == {"hr@one.example", "talent@two.example"}
+    assert {item["status"] for item in logs["items"]} == {"queued"}
 
 
 @pytest.mark.asyncio
