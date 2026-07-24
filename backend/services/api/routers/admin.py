@@ -5,6 +5,7 @@ All endpoints require owner or admin role (AdminPlus dependency).
 from typing import Annotated, Any, AsyncGenerator, Literal, Optional
 import asyncio
 import json
+from datetime import timezone
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -53,6 +54,16 @@ logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 Auth = Annotated[User, Depends(AdminPlus)]
+
+
+def _parse_naive_utc_iso(value: str):
+    """Parse ISO input for DB columns stored as naive UTC timestamps."""
+    from datetime import datetime
+
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 # ── Request schemas ──────────────────────────────────────────────────────────
@@ -2683,7 +2694,6 @@ async def admin_send_logs(
     from services.api.models.db import SendLog, Job
     from sqlalchemy import func as sa_func, outerjoin
     from sqlalchemy.orm import aliased
-    from datetime import datetime
 
     conditions = []
     if candidate_id:
@@ -2692,7 +2702,7 @@ async def admin_send_logs(
         conditions.append(SendLog.status == status)
     if sent_after:
         try:
-            since = datetime.fromisoformat(sent_after)
+            since = _parse_naive_utc_iso(sent_after)
             conditions.append(SendLog.sent_at >= since)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid sent_after format, use ISO date")
@@ -2755,7 +2765,6 @@ async def admin_direct_send_logs(
     offset: int = Query(0, ge=0),
 ):
     """Direct HR send log query for operator use."""
-    from datetime import datetime
     from sqlalchemy import func as sa_func
     from services.api.models.db import Candidate, DirectSendLog
 
@@ -2768,7 +2777,7 @@ async def admin_direct_send_logs(
         conditions.append(DirectSendLog.hr_email == hr_email.strip().lower())
     if sent_after:
         try:
-            since = datetime.fromisoformat(sent_after)
+            since = _parse_naive_utc_iso(sent_after)
             conditions.append(DirectSendLog.sent_at >= since)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid sent_after format, use ISO date")
