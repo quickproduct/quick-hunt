@@ -47,8 +47,9 @@ spec:
             - -A
             - services.scraper.celery_app
             - worker
-            - --loglevel=warning
+            - --loglevel=info
             - --concurrency=1
+            - --prefetch-multiplier=1
             - -Q
             - jh_email_send,jh_email_retry
             - -Ofair
