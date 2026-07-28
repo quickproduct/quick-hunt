@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Reject committed backups and public admin secrets
         run: |
@@ -32,7 +32,7 @@ jobs:
           fi
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -82,10 +82,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -118,10 +118,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20.20.0"
           cache: npm
@@ -145,10 +145,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20.20.0"
           cache: npm
@@ -176,10 +176,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: services/render/go.mod
           cache-dependency-path: services/render/go.sum
@@ -241,6 +241,24 @@ jobs:
           fi
 
           cd "$PROJECT_DIR"
+
+          # Older deployments kept a mutable database dump inside the Git
+          # checkout. Preserve any server-local version before the incoming
+          # commit removes tracked backups, then restore only the tracked path
+          # so the fast-forward cannot destroy live backup data.
+          backup_archive_dir="$(dirname "$PROJECT_DIR")/quick-hunt-private-backups"
+          mkdir -p "$backup_archive_dir"
+          chmod 700 "$backup_archive_dir"
+          while IFS= read -r -d '' entry; do
+            backup_path="${entry:3}"
+            if [[ -f "$backup_path" ]]; then
+              archive_path="$backup_archive_dir/$(basename "$backup_path").$(date -u '+%Y%m%dT%H%M%SZ')"
+              cp --preserve=mode,timestamps "$backup_path" "$archive_path"
+              chmod 600 "$archive_path"
+              echo "Preserved server-local backup at $archive_path"
+            fi
+            git restore --worktree -- "$backup_path"
+          done < <(git status --porcelain=v1 -z --untracked-files=no -- infra/backups)
 
           echo "Rotating the server-side admin API key from the protected Actions secret..."
           python3 - <<'PY'
