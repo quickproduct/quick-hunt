@@ -13,7 +13,8 @@ COPY backend/requirements-shared.txt ./backend/requirements-shared.txt
 COPY backend/services/api/requirements.txt ./backend/services/api/requirements.txt
 
 # Install dependencies
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir --upgrade pip "setuptools>=83.0.0" wheel && \
+    python -m pip install --no-cache-dir \
     -r backend/requirements-shared.txt \
     -r backend/services/api/requirements.txt
 
