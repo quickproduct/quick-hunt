@@ -484,7 +484,9 @@ verify_cluster() {
     previous_signatures="$(printf '%s\n' "$previous_matches" | summarize_runtime_failure_signatures)"
     current_exception_types="$($K logs "$pod" --all-containers --since=15m --tail=1000 2>/dev/null | grep -Eo "$traceback_exception_pattern" | sed 's/:$//' | sort -u | paste -sd, - || true)"
     previous_exception_types="$($K logs "$pod" --all-containers --previous --tail=500 2>/dev/null | grep -Eo "$traceback_exception_pattern" | sed 's/:$//' | sort -u | paste -sd, - || true)"
-    deletion_timestamp="$($K get pod "$pod" -o jsonpath='{.metadata.deletionTimestamp}')"
+    # KEDA may finish scaling an idle worker to zero between the pod list and
+    # this lookup. A pod that is already gone has no active failures to count.
+    deletion_timestamp="$($K get pod "$pod" -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)"
     if [[ -z "$deletion_timestamp" && "${current_errors:-0}" -gt 0 ]]; then
       active_runtime_failures=$((active_runtime_failures + current_errors))
     fi
