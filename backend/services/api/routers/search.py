@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.cache import cache_get, cache_set
 from services.api.core.database import get_db
-from services.api.core.dependencies import get_current_user
+from services.api.core.dependencies import get_current_data_user
 from services.api.models.db import Candidate, SearchTask, User
 from services.api.schemas.schemas import SearchRequest, SearchResponse, SearchTaskOut
 from services.scraper.celery_app import VALID_PORTALS, celery_app
@@ -17,7 +17,7 @@ from services.scraper.celery_app import VALID_PORTALS, celery_app
 _SEARCH_TASKS_CACHE_TTL = 30  # seconds
 
 router = APIRouter(prefix="/search", tags=["search"])
-Auth = Annotated[User, Depends(get_current_user)]
+Auth = Annotated[User, Depends(get_current_data_user)]
 
 
 @router.post("", response_model=SearchResponse)

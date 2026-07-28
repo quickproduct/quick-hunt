@@ -13,7 +13,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.database import get_db
-from services.api.core.dependencies import get_current_user
+from services.api.core.dependencies import get_current_data_user
 from services.api.models.db import MncCompany, SENTINEL_TENANT_ID, User
 from services.api.schemas.schemas import (
     MncCompanyCreate,
@@ -22,7 +22,7 @@ from services.api.schemas.schemas import (
 )
 
 router = APIRouter(prefix="/mnc-companies", tags=["mnc-companies"])
-Auth = Annotated[User, Depends(get_current_user)]
+Auth = Annotated[User, Depends(get_current_data_user)]
 
 _ATS_REQUIRES_SLUG = {"greenhouse", "lever", "smartrecruiters"}
 

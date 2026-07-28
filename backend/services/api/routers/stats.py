@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.cache import cache_get, cache_set
 from services.api.core.database import get_db
-from services.api.core.dependencies import get_current_user
+from services.api.core.dependencies import get_current_data_user
 from services.api.models.db import (
     SENTINEL_TENANT_ID,
     BlacklistedCompany,
@@ -20,7 +20,7 @@ from services.api.schemas.schemas import HREmailPipelineStats, StatsOut
 from services.common.placeholder_emails import PLACEHOLDER_DOMAINS, PLACEHOLDER_EMAILS
 
 router = APIRouter(tags=["stats"])
-Auth = Annotated[User, Depends(get_current_user)]
+Auth = Annotated[User, Depends(get_current_data_user)]
 
 _CACHE_TTL = 30  # seconds — matches frontend auto-refresh interval
 

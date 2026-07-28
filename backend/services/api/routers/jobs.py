@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.cache import cache_delete, cache_get, cache_set
 from services.api.core.database import get_db
-from services.api.core.dependencies import get_current_user
+from services.api.core.dependencies import get_current_data_user
 from services.api.models.db import (
     SENTINEL_TENANT_ID,
     BlacklistedCompany,
@@ -53,7 +53,7 @@ def _count_cache_key(**params) -> str:
     ).hexdigest()
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-Auth = Annotated[User, Depends(get_current_user)]
+Auth = Annotated[User, Depends(get_current_data_user)]
 logger = structlog.get_logger(__name__)
 
 

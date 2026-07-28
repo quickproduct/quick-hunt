@@ -8,7 +8,11 @@ from sqlalchemy import func, select
 
 from services.ai.workflow import static_cover_letter_node
 from services.api.core import database
-from services.api.core.dependencies import PlatformAdmin
+from services.api.core.dependencies import (
+    PlatformAdmin,
+    SEEDED_ADMIN_TENANT_ID,
+    get_current_data_user,
+)
 from services.api.core.security import decode_token, hash_password
 from services.api.models.db import (
     SENTINEL_TENANT_ID,
@@ -69,6 +73,21 @@ def test_platform_admin_accepts_internal_service_account():
 
 
 @pytest.mark.asyncio
+async def test_seeded_admin_uses_operational_data_scope():
+    admin = _user(SEEDED_ADMIN_TENANT_ID)
+    scoped = await get_current_data_user(admin)
+
+    assert scoped.tenant_id == SENTINEL_TENANT_ID
+    assert scoped.role == "owner"
+
+
+@pytest.mark.asyncio
+async def test_customer_keeps_own_data_scope():
+    customer = _user("tenant-customer")
+    assert await get_current_data_user(customer) is customer
+
+
+@pytest.mark.asyncio
 async def test_login_selects_matching_tenant_password(db_session, monkeypatch):
     async def _no_op_store(*_args, **_kwargs):
         return None
@@ -115,6 +134,17 @@ async def test_candidate_detail_hides_other_tenant(db_session):
     with pytest.raises(HTTPException) as exc:
         await get_candidate(candidate.id, _user("tenant-b"), db_session)
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_seeded_admin_can_read_operational_candidate(db_session):
+    candidate = _candidate(SENTINEL_TENANT_ID)
+    db_session.add(candidate)
+    await db_session.commit()
+
+    admin = await get_current_data_user(_user(SEEDED_ADMIN_TENANT_ID))
+    result = await get_candidate(candidate.id, admin, db_session)
+    assert result.id == candidate.id
 
 
 @pytest.mark.asyncio

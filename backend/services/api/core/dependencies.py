@@ -10,7 +10,7 @@ Usage:
         ...
 """
 
-from typing import Annotated, Optional
+from typing import Annotated, Optional, cast
 
 from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -29,6 +29,7 @@ PLATFORM_ADMIN_TENANT_IDS = frozenset({
     SENTINEL_TENANT_ID,
     "00000000-0000-0000-0000-000000000002",
 })
+SEEDED_ADMIN_TENANT_ID = "00000000-0000-0000-0000-000000000002"
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -90,6 +91,36 @@ async def get_current_tenant(
     if not tenant:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found.")
     return tenant
+
+
+class _DataScopedUser:
+    """Read-only user proxy with an explicit operational-data tenant."""
+
+    def __init__(self, user: User, tenant_id: str):
+        self._user = user
+        self.tenant_id = tenant_id
+
+    def __getattr__(self, name: str):
+        return getattr(self._user, name)
+
+
+async def get_current_data_user(
+    user: User = Depends(get_current_user),
+) -> User:
+    """Resolve the tenant used by legacy operational business data.
+
+    The seeded platform administrator has a separate Pro tenant for account,
+    billing, and team settings. Existing candidates, jobs, sends, searches,
+    and shared lists belong to the sentinel operational tenant. Map only that
+    privileged account to the sentinel scope for business-data routers while
+    leaving every customer tenant isolated.
+    """
+    if (
+        user.tenant_id == SEEDED_ADMIN_TENANT_ID
+        and user.role in ("owner", "admin")
+    ):
+        return cast(User, _DataScopedUser(user, SENTINEL_TENANT_ID))
+    return user
 
 
 # ── Annotated shortcuts ───────────────────────────────────────────────────────
