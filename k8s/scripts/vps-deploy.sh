@@ -64,6 +64,7 @@ validate_env() {
 cleanup_stale_terminating_api_pods() {
   kubectl get namespace "$NS" >/dev/null 2>&1 || return 0
 
+  local minimum_age_seconds="${1:-300}"
   local now pod deleted_at deleted_epoch age_seconds
   now="$(date +%s)"
   while IFS=$'\t' read -r pod deleted_at; do
@@ -71,7 +72,7 @@ cleanup_stale_terminating_api_pods() {
     deleted_epoch="$(date -d "$deleted_at" +%s 2>/dev/null || echo 0)"
     [[ "$deleted_epoch" -gt 0 ]] || continue
     age_seconds=$((now - deleted_epoch))
-    if [[ "$age_seconds" -ge 300 ]]; then
+    if [[ "$age_seconds" -ge "$minimum_age_seconds" ]]; then
       log "Force-removing stale terminating API pod $pod (terminating for ${age_seconds}s)..."
       $K delete pod "$pod" --grace-period=0 --force --wait=false
     fi
@@ -246,10 +247,20 @@ deploy_cluster() {
   fi
 
   log "Waiting for core app rollouts..."
-  # A pod can enter deletion after the manifests are applied, so perform the
-  # guarded age check again at the exact point where it could block rollout.
-  cleanup_stale_terminating_api_pods
-  $K rollout status deployment/api --timeout=180s
+  if ! $K rollout status deployment/api --timeout=60s; then
+    # The replacement must be serving before shortening an abnormally long
+    # termination. If it is not available, retain the old pod and fail safely.
+    local api_desired api_available
+    api_desired="$($K get deployment api -o jsonpath='{.spec.replicas}')"
+    api_available="$($K get deployment api -o jsonpath='{.status.availableReplicas}')"
+    if [[ "${api_available:-0}" -lt "${api_desired:-1}" ]]; then
+      die "API replacement is unavailable; refusing to force-delete the old pod."
+    fi
+
+    log "API replacement is available; clearing old pods still terminating after 30 seconds..."
+    cleanup_stale_terminating_api_pods 30
+    $K rollout status deployment/api --timeout=120s
+  fi
   $K rollout status deployment/dashboard --timeout=180s
   $K rollout status deployment/beat --timeout=180s
 
