@@ -38,13 +38,29 @@ log "Checking pod $NAMESPACE/$POD..."
 kubectl get pod "$POD" --namespace "$NAMESPACE" >/dev/null
 
 log "Starting full PostgreSQL backup from $NAMESPACE/$POD..."
-kubectl exec --namespace "$NAMESPACE" "$POD" --container "$CONTAINER" -- bash -lc '
-  set -euo pipefail
-  : "${POSTGRES_USER:?POSTGRES_USER is not set in the pod}"
-  : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set in the pod}"
-  export PGPASSWORD="$POSTGRES_PASSWORD"
-  pg_dumpall --username="$POSTGRES_USER" --clean --if-exists
-' | gzip -9 > "$BACKUP_FILE"
+backup_complete=false
+for attempt in 1 2 3; do
+  : > "$BACKUP_FILE"
+  if kubectl exec --namespace "$NAMESPACE" "$POD" --container "$CONTAINER" -- bash -lc '
+    set -euo pipefail
+    : "${POSTGRES_USER:?POSTGRES_USER is not set in the pod}"
+    : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set in the pod}"
+    command -v gzip >/dev/null 2>&1
+    export PGPASSWORD="$POSTGRES_PASSWORD"
+    pg_dumpall --username="$POSTGRES_USER" --clean --if-exists | gzip -9
+  ' > "$BACKUP_FILE"; then
+    backup_complete=true
+    break
+  fi
+
+  log "Backup stream attempt $attempt failed; retrying with a fresh output file..."
+  sleep 2
+done
+
+if [[ "$backup_complete" != "true" ]]; then
+  rm -f "$BACKUP_FILE"
+  die "Backup failed after 3 compressed transfer attempts"
+fi
 
 if [[ ! -s "$BACKUP_FILE" ]]; then
   rm -f "$BACKUP_FILE"
