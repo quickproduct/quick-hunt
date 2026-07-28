@@ -199,6 +199,7 @@ jobs:
       VPS_USER: ${{ secrets.VPS_USER || 'root' }}
       VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
       ROTATED_ADMIN_API_KEY: ${{ secrets.QUICKHUNT_ADMIN_API_KEY }}
+      ROTATED_INITIAL_ADMIN_PASSWORD: ${{ secrets.QUICKHUNT_INITIAL_ADMIN_PASSWORD }}
       VPS_PROJECT_DIR: ${{ secrets.VPS_PROJECT_DIR || '/root/quick-hunt' }}
       REPO_URL: https://github.com/quickproduct/quick-hunt.git
       BRANCH: main
@@ -210,6 +211,7 @@ jobs:
           test -n "$VPS_USER"
           test -n "$VPS_PASSWORD"
           test -n "$ROTATED_ADMIN_API_KEY"
+          test -n "$ROTATED_INITIAL_ADMIN_PASSWORD"
           test -n "$VPS_PROJECT_DIR"
 
       - name: Install SSH password client
@@ -224,7 +226,7 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=10 \
             "$VPS_USER@$VPS_HOST" \
-            "PROJECT_DIR='$VPS_PROJECT_DIR' REPO_URL='$REPO_URL' BRANCH='$BRANCH' ROTATED_ADMIN_API_KEY='$ROTATED_ADMIN_API_KEY' bash -se" <<'REMOTE'
+            "PROJECT_DIR='$VPS_PROJECT_DIR' REPO_URL='$REPO_URL' BRANCH='$BRANCH' ROTATED_ADMIN_API_KEY='$ROTATED_ADMIN_API_KEY' ROTATED_INITIAL_ADMIN_PASSWORD='$ROTATED_INITIAL_ADMIN_PASSWORD' bash -se" <<'REMOTE'
           set -euo pipefail
 
           echo "Step 2 - Connected to $(hostname)"
@@ -260,24 +262,29 @@ jobs:
             git restore --worktree -- "$backup_path"
           done < <(git status --porcelain=v1 -z --untracked-files=no -- infra/backups)
 
-          echo "Rotating the server-side admin API key from the protected Actions secret..."
+          echo "Rotating server-side administrator credentials from protected Actions secrets..."
           python3 - <<'PY'
           import os
           from pathlib import Path
 
           path = Path("infra/.env")
-          key = os.environ["ROTATED_ADMIN_API_KEY"]
+          replacements = {
+              "ADMIN_API_KEY": os.environ["ROTATED_ADMIN_API_KEY"],
+              "INITIAL_ADMIN_PASSWORD": os.environ["ROTATED_INITIAL_ADMIN_PASSWORD"],
+          }
           lines = path.read_text(encoding="utf-8").splitlines()
           updated = []
-          replaced = False
+          replaced = set()
           for line in lines:
-              if line.startswith("ADMIN_API_KEY="):
-                  updated.append(f"ADMIN_API_KEY={key}")
-                  replaced = True
-              else:
-                  updated.append(line)
-          if not replaced:
-              updated.append(f"ADMIN_API_KEY={key}")
+              key = line.partition("=")[0]
+              if key in replacements:
+                  updated.append(f"{key}={replacements[key]}")
+                  replaced.add(key)
+                  continue
+              updated.append(line)
+          for key, value in replacements.items():
+              if key not in replaced:
+                  updated.append(f"{key}={value}")
           path.write_text("\n".join(updated) + "\n", encoding="utf-8")
           path.chmod(0o600)
           PY

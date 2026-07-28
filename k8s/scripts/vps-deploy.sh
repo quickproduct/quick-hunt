@@ -90,6 +90,17 @@ normalize_optional_integrations() {
   fi
 }
 
+backup_database() {
+  local backup_dir
+  backup_dir="${DATABASE_BACKUP_DIR:-$(dirname "$REPO_ROOT")/quick-hunt-private-backups/k3s-postgres}"
+  log "Taking a full PostgreSQL rollback backup before migrations..."
+  umask 077
+  BACKUP_DIR="$backup_dir" RETENTION_DAYS="${DATABASE_BACKUP_RETENTION_DAYS:-14}" \
+    bash "$REPO_ROOT/infra/scripts/k3s_db_backup.sh"
+  chmod 700 "$backup_dir"
+  find "$backup_dir" -maxdepth 1 -type f -name 'postgres_full_*.sql.gz' -exec chmod 600 {} +
+}
+
 cleanup_stale_terminating_api_pods() {
   kubectl get namespace "$NS" >/dev/null 2>&1 || return 0
 
@@ -488,15 +499,83 @@ verify_cluster() {
   fi
 }
 
+verify_database() {
+  local audit_query audit_row
+  local revision tenants users memberships candidates jobs send_logs
+  local admin_users admin_memberships orphan_users orphan_candidates orphan_jobs orphan_send_logs
+
+  log "Validating database revision, core counts, administrator, and tenant references..."
+  read -r -d '' audit_query <<'SQL' || true
+SELECT
+  (SELECT version_num FROM alembic_version LIMIT 1),
+  (SELECT count(*) FROM tenants),
+  (SELECT count(*) FROM users),
+  (SELECT count(*) FROM memberships),
+  (SELECT count(*) FROM candidates),
+  (SELECT count(*) FROM jobs),
+  (SELECT count(*) FROM send_logs),
+  (SELECT count(*) FROM users WHERE tenant_id = '00000000-0000-0000-0000-000000000002' AND email = 'admin@gmail.com' AND role = 'owner' AND is_verified AND is_active),
+  (SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.tenant_id = '00000000-0000-0000-0000-000000000002' AND u.email = 'admin@gmail.com' AND m.tenant_id = u.tenant_id AND m.role = 'owner'),
+  (SELECT count(*) FROM users u LEFT JOIN tenants t ON t.id = u.tenant_id WHERE t.id IS NULL),
+  (SELECT count(*) FROM candidates c LEFT JOIN tenants t ON t.id = c.tenant_id WHERE t.id IS NULL),
+  (SELECT count(*) FROM jobs j LEFT JOIN tenants t ON t.id = j.tenant_id WHERE t.id IS NULL),
+  (SELECT count(*) FROM send_logs s LEFT JOIN tenants t ON t.id = s.tenant_id WHERE t.id IS NULL);
+SQL
+  audit_row="$(printf '%s\n' "$audit_query" | $K exec -i postgres-0 -- bash -lc '
+    export PGPASSWORD="$POSTGRES_PASSWORD"
+    psql --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --tuples-only --no-align --field-separator="|"
+  ')"
+
+  IFS='|' read -r revision tenants users memberships candidates jobs send_logs \
+    admin_users admin_memberships orphan_users orphan_candidates orphan_jobs orphan_send_logs \
+    <<< "$audit_row"
+
+  printf 'database-audit revision=%s tenants=%s users=%s memberships=%s candidates=%s jobs=%s send_logs=%s admin_users=%s admin_memberships=%s orphan_users=%s orphan_candidates=%s orphan_jobs=%s orphan_send_logs=%s\n' \
+    "$revision" "$tenants" "$users" "$memberships" "$candidates" "$jobs" "$send_logs" \
+    "$admin_users" "$admin_memberships" "$orphan_users" "$orphan_candidates" "$orphan_jobs" "$orphan_send_logs"
+
+  [[ "$revision" == "0034" ]] || die "Database is not at Alembic revision 0034."
+  [[ "$admin_users" == "1" && "$admin_memberships" == "1" ]] || \
+    die "Seeded administrator or owner membership is invalid."
+  [[ "$orphan_users" == "0" && "$orphan_candidates" == "0" && "$orphan_jobs" == "0" && "$orphan_send_logs" == "0" ]] || \
+    die "Database contains tenant-orphaned records."
+}
+
+verify_admin_login() {
+  log "Verifying seeded administrator login through the deployed API..."
+  $K exec deployment/api -- python -c '
+import json
+import os
+import urllib.request
+
+password = os.environ.get("INITIAL_ADMIN_PASSWORD", "")
+assert len(password) >= 16, "INITIAL_ADMIN_PASSWORD is unavailable in the API container"
+request = urllib.request.Request(
+    "http://127.0.0.1:8000/auth/login",
+    data=json.dumps({"email": "admin@gmail.com", "password": password}).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=15) as response:
+    payload = json.load(response)
+assert payload.get("access_token"), "login response did not contain an access token"
+assert payload.get("refresh_token"), "login response did not contain a refresh token"
+print("Admin login: ok")
+'
+}
+
 main() {
   cd "$REPO_ROOT"
   require_tools
   validate_env
   normalize_optional_integrations
+  backup_database
   cleanup_stale_terminating_api_pods
   build_and_import_images
   deploy_cluster
   verify_cluster
+  verify_database
+  verify_admin_login
 
   log "Deployment complete."
   kubectl get nodes -o wide
