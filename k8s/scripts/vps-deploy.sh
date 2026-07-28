@@ -99,9 +99,33 @@ cleanup_superseded_api_pods() {
   )
 }
 
+dump_target_api_diagnostics() {
+  local target_image="${IMAGE_PREFIX}/jh-api:${IMAGE_TAG}"
+  local pod
+  while IFS= read -r pod; do
+    [[ -n "$pod" ]] || continue
+    log "Diagnostics for target API pod $pod:"
+    $K describe pod "$pod" || true
+    $K logs "$pod" --all-containers --tail=200 || true
+    $K logs "$pod" --all-containers --previous --tail=200 || true
+  done < <(
+    $K get pods -l app=api -o json | TARGET_IMAGE="$target_image" python3 -c '
+import json
+import os
+import sys
+
+target = os.environ["TARGET_IMAGE"]
+for pod in json.load(sys.stdin).get("items", []):
+    images = [container.get("image") for container in pod.get("spec", {}).get("containers", [])]
+    if target in images:
+        print(pod.get("metadata", {}).get("name", ""))
+'
+  )
+}
+
 wait_for_target_api_replicas() {
   local target_image="${IMAGE_PREFIX}/jh-api:${IMAGE_TAG}"
-  local desired deadline ready_count
+  local desired deadline ready_count crash_count
   desired="$($K get deployment api -o jsonpath='{.spec.replicas}')"
   deadline=$((SECONDS + 120))
 
@@ -126,10 +150,32 @@ print(ready)
       log "Target API image $target_image has ${ready_count}/${desired} Ready replicas."
       return 0
     fi
+
+    crash_count="$($K get pods -l app=api -o json | TARGET_IMAGE="$target_image" python3 -c '
+import json
+import os
+import sys
+
+target = os.environ["TARGET_IMAGE"]
+pods = json.load(sys.stdin).get("items", [])
+crashes = 0
+for pod in pods:
+    images = [container.get("image") for container in pod.get("spec", {}).get("containers", [])]
+    statuses = pod.get("status", {}).get("containerStatuses", [])
+    waiting = [item.get("state", {}).get("waiting", {}).get("reason") for item in statuses]
+    if target in images and "CrashLoopBackOff" in waiting:
+        crashes += 1
+print(crashes)
+')"
+    if [[ "${crash_count:-0}" -gt 0 ]]; then
+      dump_target_api_diagnostics
+      die "Target API image $target_image entered CrashLoopBackOff."
+    fi
     sleep 5
   done
 
   $K get pods -l app=api -o wide >&2
+  dump_target_api_diagnostics
   die "Target API image $target_image did not reach ${desired} Ready replicas."
 }
 
