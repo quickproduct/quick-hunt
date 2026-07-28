@@ -5,7 +5,8 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt as _bcrypt
-from jose import JWTError, jwt
+import jwt
+from jwt import InvalidTokenError as JWTError
 
 from services.api.core.config import get_settings
 

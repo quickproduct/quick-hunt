@@ -66,7 +66,6 @@ export function humanize(value?: string | null): string {
 export function jobStatusTone(status?: JobStatus | string): 'mint' | 'cyan' | 'amber' | 'coral' | 'neutral' {
   switch (status) {
     case 'sent':
-    case 'applied':
     case 'cover_generated':
       return 'mint';
     case 'scoring':

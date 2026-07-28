@@ -238,11 +238,30 @@ async def static_cover_letter_node(state: ApplicationWorkflowState) -> dict:
     job_id = state["job_id"]
     session_factory = get_worker_session_factory()
     async with session_factory() as session:
+        job = await session.get(Job, job_id)
+        if not job:
+            logger.warning("static_cover_letter_node_job_not_found", job_id=job_id)
+            return {"approval_status": "rejected", "error": "job_not_found"}
+
         candidate_id = state.get("candidate_id")
         candidate = await session.get(Candidate, candidate_id) if candidate_id else None
+        if candidate and candidate.tenant_id != job.tenant_id:
+            logger.warning(
+                "static_cover_letter_node_candidate_tenant_mismatch",
+                job_id=job_id,
+                job_tenant_id=job.tenant_id,
+                candidate_id=candidate.id,
+                candidate_tenant_id=candidate.tenant_id,
+            )
+            candidate = None
         if not candidate:
             result = await session.execute(
-                select(Candidate).where(Candidate.is_active.is_(True)).limit(1)
+                select(Candidate)
+                .where(
+                    Candidate.tenant_id == job.tenant_id,
+                    Candidate.is_active.is_(True),
+                )
+                .limit(1)
             )
             candidate = result.scalar_one_or_none()
 

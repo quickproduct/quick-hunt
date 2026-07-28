@@ -103,19 +103,35 @@ async def login(
 ) -> TokenResponse:
     """Authenticate user and return JWT pair.
 
-    If tenant_id is not provided, finds the first active tenant for this email.
+    If tenant_id is omitted, verify the password against every active account
+    with this email. Selecting an arbitrary first row made login depend on the
+    database query plan once the same email existed in multiple tenants.
     """
     if not tenant_id:
-        # Find user by email across all tenants (picks first match)
         from sqlalchemy import select
         result = await session.execute(
             select(User).where(User.email == email, User.is_active == True)  # noqa
         )
-        user = result.scalars().first()
+        matching_users = [
+            candidate
+            for candidate in result.scalars().all()
+            if verify_password(plain_password, candidate.hashed_password)
+        ]
+        if len(matching_users) > 1:
+            logger.warning(
+                "user_login_tenant_ambiguous",
+                email=email,
+                matching_accounts=len(matching_users),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Multiple accounts match this login. Provide tenant_id.",
+            )
+        user = matching_users[0] if matching_users else None
     else:
         user = await user_repo.get_user_by_email(session, email, tenant_id)
 
-    if not user or not verify_password(plain_password, user.hashed_password):
+    if not user or (tenant_id and not verify_password(plain_password, user.hashed_password)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -127,13 +143,13 @@ async def login(
     refresh_token, jti = create_refresh_token(user.id, user.tenant_id)
     await _store_refresh_jti(user.id, jti)
 
-    logger.info("user_logged_in", user_id=user.id)
+    logger.info("user_logged_in", user_id=user.id, tenant_id=user.tenant_id)
     return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
 
 async def refresh_tokens(session: AsyncSession, refresh_token: str) -> TokenResponse:
     """Rotate refresh token — invalidate old jti, issue new pair."""
-    from jose import JWTError
+    from jwt import InvalidTokenError as JWTError
     from services.api.core.security import decode_token
 
     try:
@@ -170,7 +186,7 @@ async def refresh_tokens(session: AsyncSession, refresh_token: str) -> TokenResp
 
 async def logout(user_id: str, refresh_token: str) -> None:
     """Revoke the refresh token jti."""
-    from jose import JWTError
+    from jwt import InvalidTokenError as JWTError
     from services.api.core.security import decode_token
     try:
         payload = decode_token(refresh_token)

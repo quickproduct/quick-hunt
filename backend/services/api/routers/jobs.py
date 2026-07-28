@@ -1,19 +1,26 @@
 """Jobs router — list, filter, detail, status update, cover letter generation, bulk ops."""
 import hashlib
 import json
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import asc, desc, exists, func, or_, select
+from sqlalchemy import asc, desc, exists, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.cache import cache_delete, cache_get, cache_set
 from services.api.core.database import get_db
 from services.api.core.dependencies import get_current_user
-from services.api.models.db import BlacklistedCompany, Candidate, Job, User
+from services.api.models.db import (
+    SENTINEL_TENANT_ID,
+    BlacklistedCompany,
+    Candidate,
+    Job,
+    User,
+)
 from services.api.schemas.schemas import (
     BulkGenerateCoverRequest,
     BulkSendRequest,
@@ -52,6 +59,7 @@ logger = structlog.get_logger(__name__)
 
 def _apply_job_filters(
     q,
+    tenant_id: str,
     status: Optional[str],
     portal: Optional[str],
     company: Optional[str],
@@ -69,6 +77,7 @@ def _apply_job_filters(
     candidate_id: Optional[str] = None,
 ):
     """Apply all common where-clause filters to a job query."""
+    q = q.where(Job.tenant_id == tenant_id)
     if candidate_id:
         q = q.where(Job.candidate_id == candidate_id)
     if status:
@@ -163,11 +172,12 @@ def _apply_job_filters(
     q = q.where(
         ~exists(
             select(BlacklistedCompany.id).where(
+                BlacklistedCompany.tenant_id.in_((tenant_id, SENTINEL_TENANT_ID)),
                 or_(
-                    job_co_lower.like(func.concat("%", bl_lower, "%")),
-                    bl_lower.like(func.concat("%", job_co_lower, "%")),
-                    job_co_nospace.like(func.concat("%", bl_nospace, "%")),
-                    bl_nospace.like(func.concat("%", job_co_nospace, "%")),
+                    job_co_lower.like(literal("%") + bl_lower + literal("%")),
+                    bl_lower.like(literal("%") + job_co_lower + literal("%")),
+                    job_co_nospace.like(literal("%") + bl_nospace + literal("%")),
+                    bl_nospace.like(literal("%") + job_co_nospace + literal("%")),
                 )
             )
         )
@@ -177,7 +187,7 @@ def _apply_job_filters(
 
 @router.get("", response_model=list[JobOut])
 async def list_jobs(
-    _: Auth,
+    current_user: Auth,
     db: AsyncSession = Depends(get_db),
     # existing filters
     status: Optional[str] = Query(None),
@@ -204,6 +214,7 @@ async def list_jobs(
     page_size: int = Query(default=20, ge=1, le=100),
 ):
     cache_key = _list_cache_key(
+        tenant_id=current_user.tenant_id,
         status=status, portal=portal, company=company, has_hr_email=has_hr_email,
         min_score=min_score, search=search, max_score=max_score, has_cover=has_cover,
         job_type=job_type, has_active_send=has_active_send, scraped_after=scraped_after,
@@ -219,6 +230,7 @@ async def list_jobs(
     q = select(Job)
     q = _apply_job_filters(
         q,
+        tenant_id=current_user.tenant_id,
         status=status,
         portal=portal,
         company=company,
@@ -253,7 +265,7 @@ async def list_jobs(
 
 @router.get("/count")
 async def count_jobs(
-    _: Auth,
+    current_user: Auth,
     db: AsyncSession = Depends(get_db),
     status: Optional[str] = Query(None),
     portal: Optional[str] = Query(None),
@@ -272,6 +284,7 @@ async def count_jobs(
     candidate_id: Optional[str] = Query(None),
 ) -> dict:
     cache_key = _count_cache_key(
+        tenant_id=current_user.tenant_id,
         status=status, portal=portal, company=company, has_hr_email=has_hr_email,
         min_score=min_score, search=search, max_score=max_score, has_cover=has_cover,
         job_type=job_type, has_active_send=has_active_send, scraped_after=scraped_after,
@@ -285,6 +298,7 @@ async def count_jobs(
     q = select(func.count()).select_from(Job)
     q = _apply_job_filters(
         q,
+        tenant_id=current_user.tenant_id,
         status=status,
         portal=portal,
         company=company,
@@ -311,7 +325,7 @@ async def count_jobs(
 
 @router.get("/ids", response_model=list[str])
 async def list_job_ids(
-    _: Auth,
+    current_user: Auth,
     db: AsyncSession = Depends(get_db),
     status: Optional[str] = Query(None),
     portal: Optional[str] = Query(None),
@@ -338,6 +352,7 @@ async def list_job_ids(
     q = select(Job.id)
     q = _apply_job_filters(
         q,
+        tenant_id=current_user.tenant_id,
         status=status,
         portal=portal,
         company=company,
@@ -363,6 +378,7 @@ async def list_job_ids(
 async def trigger_mnc_scrape(
     current_user: Auth,
     candidate_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
 ):
     """Enqueue an MNC scrape dispatcher task.
 
@@ -373,6 +389,10 @@ async def trigger_mnc_scrape(
     from services.scraper.celery_app import celery_app as _celery
 
     tid = current_user.tenant_id
+    if candidate_id:
+        candidate = await db.get(Candidate, candidate_id)
+        if not candidate or candidate.tenant_id != tid:
+            raise HTTPException(status_code=404, detail="Candidate not found")
     lock_key = f"mnc:scrape:lock:{tid}"
 
     # Cheap pre-check so the UI gets immediate feedback; the worker still
@@ -451,12 +471,17 @@ async def get_mnc_scrape_status(current_user: Auth):
 async def trigger_consulting_scrape(
     current_user: Auth,
     candidate_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
 ):
     """Enqueue a consulting/outsourcing scrape dispatcher task."""
     from services.api.core.cache import get_redis
     from services.scraper.celery_app import celery_app as _celery
 
     tid = current_user.tenant_id
+    if candidate_id:
+        candidate = await db.get(Candidate, candidate_id)
+        if not candidate or candidate.tenant_id != tid:
+            raise HTTPException(status_code=404, detail="Candidate not found")
     lock_key = f"consulting:scrape:lock:{tid}"
 
     try:
@@ -527,12 +552,20 @@ async def get_consulting_scrape_status(current_user: Auth):
 
 @router.post("/bulk_generate_cover")
 async def bulk_generate_cover(
-    body: BulkGenerateCoverRequest, _: Auth, db: AsyncSession = Depends(get_db)
+    body: BulkGenerateCoverRequest, current_user: Auth, db: AsyncSession = Depends(get_db)
 ):
     # Route through the rate-limited batch queue instead of firing N tasks
     # directly onto jh_cover_letter_generation. The batch queue drains at
     # GROQ_RPM/min so workers never stall competing for Groq slots.
-    result = await db.execute(select(Job.id).where(Job.id.in_(body.job_ids)))
+    candidate = await db.get(Candidate, body.candidate_id)
+    if not candidate or candidate.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    result = await db.execute(
+        select(Job.id).where(
+            Job.tenant_id == current_user.tenant_id,
+            Job.id.in_(body.job_ids),
+        )
+    )
     found_ids = {row[0] for row in result.all()}
     not_found = [jid for jid in body.job_ids if jid not in found_ids]
 
@@ -551,41 +584,46 @@ async def bulk_generate_cover(
 
 @router.post("/bulk_send", response_model=BulkSendResponse)
 async def bulk_send(
-    body: BulkSendRequest, _: Auth, db: AsyncSession = Depends(get_db)
+    body: BulkSendRequest, current_user: Auth, db: AsyncSession = Depends(get_db)
 ):
     from services.api.models.db import SendLog
     from services.api.core.blacklist_utils import get_blacklisted_names, is_company_blacklisted
     from services.api.models.hr_email_utils import get_hr_email_status
-    from services.sender.tasks import send_application_email_task
     from services.common.placeholder_emails import is_placeholder_email
+    from services.api.core.config import get_settings
 
     candidate = await db.get(Candidate, body.candidate_id)
-    if not candidate:
+    if not candidate or candidate.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     # Fetch all requested jobs in one IN query instead of N individual GETs
     jobs_result = await db.execute(
         select(
             Job.id,
+            Job.job_title,
             Job.hr_email,
             Job.cover_letter,
             Job.status,
             Job.candidate_id,
             Job.company,
             Job.tenant_id,
-        ).where(Job.id.in_(body.job_ids))
+        ).where(
+            Job.tenant_id == current_user.tenant_id,
+            Job.id.in_(body.job_ids),
+        ).with_for_update()
     )
     jobs_map = {row.id: row for row in jobs_result.all()}
-    blacklist = await get_blacklisted_names(db)
+    blacklist = await get_blacklisted_names(db, current_user.tenant_id)
 
     # Block re-send if there is ANY active/in-flight send_log for this (job, candidate).
     # This covers: queued, sent, deferred (Brevo retrying), soft_bounced/blocked (our retry
     # scheduled), delivered/opened/clicked (already successful).
     # Only terminal failures (bounced, spam, unsubscribed) allow a fresh send attempt.
-    _ACTIVE_STATUSES = ("queued", "sent", "deferred", "soft_bounced", "blocked",
+    _ACTIVE_STATUSES = ("queued", "sending", "sent", "deferred", "soft_bounced", "blocked",
                         "delivered", "opened", "clicked")
     already_active_result = await db.execute(
         select(SendLog.job_id).where(
+            SendLog.tenant_id == current_user.tenant_id,
             SendLog.job_id.in_(body.job_ids),
             SendLog.candidate_id == body.candidate_id,
             SendLog.status.in_(_ACTIVE_STATUSES),
@@ -595,6 +633,8 @@ async def bulk_send(
 
     task_ids: list[str] = []
     skipped: list[SkippedJob] = []
+    reservations: list[tuple[SendLog, str]] = []
+    settings = get_settings()
 
     for job_id in body.job_ids:
         job = jobs_map.get(job_id)
@@ -630,20 +670,53 @@ async def bulk_send(
             task_ids.append(f"dry_run_{job_id}")
             continue
 
-        task = celery_app.send_task(
-            "services.sender.tasks.send_application_email_task",
-            kwargs={
-                "job_id": job_id,
-                "candidate_id": body.candidate_id,
-                "override_email": None,
-                "override_subject": None,
-                "attach_resume": body.attach_resume,
-                "dry_run": False,
-            },
-            queue="jh_email_send",
-            ignore_result=True,
+        reservation = SendLog(
+            id=str(uuid.uuid4()),
+            tenant_id=current_user.tenant_id,
+            job_id=job_id,
+            candidate_id=body.candidate_id,
+            to_email=settings.email_test_override or job.hr_email,
+            subject=f"Application for {job.job_title} at {job.company}",
+            body_snippet=(job.cover_letter or "")[:500],
+            status="queued",
+            provider=settings.email_provider,
         )
-        task_ids.append(task.id)
+        db.add(reservation)
+        reservations.append((reservation, job_id))
+
+    if reservations:
+        await db.commit()
+
+    for reservation, job_id in reservations:
+        try:
+            task = celery_app.send_task(
+                "services.sender.tasks.send_application_email_task",
+                kwargs={
+                    "job_id": job_id,
+                    "candidate_id": body.candidate_id,
+                    "override_email": None,
+                    "override_subject": None,
+                    "attach_resume": body.attach_resume,
+                    "dry_run": False,
+                    "send_log_id": reservation.id,
+                },
+                queue="jh_email_send",
+                ignore_result=True,
+            )
+            task_ids.append(task.id)
+        except Exception as exc:
+            reservation.status = "failed"
+            reservation.error_message = str(exc)[:1000]
+            skipped.append(SkippedJob(job_id=job_id, reason="queue_failed"))
+            logger.exception(
+                "bulk_send_queue_failed",
+                job_id=job_id,
+                candidate_id=body.candidate_id,
+                send_log_id=reservation.id,
+            )
+
+    if reservations:
+        await db.commit()
 
     skipped_by_reason = Counter(item.reason for item in skipped)
     logger.info(
@@ -666,19 +739,19 @@ async def bulk_send(
 
 
 @router.get("/{job_id}", response_model=JobOut)
-async def get_job(job_id: str, _: Auth, db: AsyncSession = Depends(get_db)):
+async def get_job(job_id: str, current_user: Auth, db: AsyncSession = Depends(get_db)):
     job = await db.get(Job, job_id)
-    if not job:
+    if not job or job.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
 @router.patch("/{job_id}/status", response_model=JobOut)
 async def update_job_status(
-    job_id: str, body: JobStatusUpdate, _: Auth, db: AsyncSession = Depends(get_db)
+    job_id: str, body: JobStatusUpdate, current_user: Auth, db: AsyncSession = Depends(get_db)
 ):
     job = await db.get(Job, job_id)
-    if not job:
+    if not job or job.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Job not found")
     job.status = body.status
     await db.flush()
@@ -687,7 +760,7 @@ async def update_job_status(
 
 @router.patch("/{job_id}/hr-email", response_model=JobOut)
 async def set_job_hr_email(
-    job_id: str, body: HrEmailUpdate, _: Auth, db: AsyncSession = Depends(get_db)
+    job_id: str, body: HrEmailUpdate, current_user: Auth, db: AsyncSession = Depends(get_db)
 ):
     """Manually set the HR email for a job, bypassing auto-discovery.
 
@@ -695,7 +768,7 @@ async def set_job_hr_email(
     the job is no longer excluded from backfill runs.
     """
     job = await db.get(Job, job_id)
-    if not job:
+    if not job or job.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Job not found")
     job.hr_email = body.hr_email.strip() or None
     if job.hr_email:
@@ -721,11 +794,15 @@ async def set_job_hr_email(
 
 @router.post("/{job_id}/generate_cover")
 async def generate_cover_letter(
-    job_id: str, body: GenerateCoverRequest, _: Auth, db: AsyncSession = Depends(get_db)
+    job_id: str, body: GenerateCoverRequest, current_user: Auth, db: AsyncSession = Depends(get_db)
 ):
     job = await db.get(Job, job_id)
-    if not job:
+    if not job or job.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    candidate = await db.get(Candidate, body.candidate_id)
+    if not candidate or candidate.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
 
     from services.ai.tasks import generate_cover_letter_task
 
@@ -740,7 +817,7 @@ async def generate_cover_letter(
 
 
 @router.get("/{job_id}/timeline", response_model=JobTimeline)
-async def get_job_timeline(job_id: str, _: Auth, db: AsyncSession = Depends(get_db)):
+async def get_job_timeline(job_id: str, current_user: Auth, db: AsyncSession = Depends(get_db)):
     """Return the full application lifecycle timeline for a job.
 
     Assembles events from the Job row and its most recent SendLog.
@@ -749,13 +826,16 @@ async def get_job_timeline(job_id: str, _: Auth, db: AsyncSession = Depends(get_
     from services.api.models.db import SendLog
 
     job = await db.get(Job, job_id)
-    if not job:
+    if not job or job.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Job not found")
 
     # Fetch the most recent send log for this job (latest sent_at)
     sl_result = await db.execute(
         select(SendLog)
-        .where(SendLog.job_id == job_id)
+        .where(
+            SendLog.tenant_id == current_user.tenant_id,
+            SendLog.job_id == job_id,
+        )
         .order_by(desc(SendLog.sent_at))
         .limit(1)
     )

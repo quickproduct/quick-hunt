@@ -3,13 +3,19 @@ import asyncio
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, or_, exists
+from sqlalchemy import exists, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.cache import cache_get, cache_set
 from services.api.core.database import get_db
 from services.api.core.dependencies import get_current_user
-from services.api.models.db import BlacklistedCompany, Job, SendLog, User
+from services.api.models.db import (
+    SENTINEL_TENANT_ID,
+    BlacklistedCompany,
+    Job,
+    SendLog,
+    User,
+)
 from services.api.schemas.schemas import HREmailPipelineStats, StatsOut
 from services.common.placeholder_emails import PLACEHOLDER_DOMAINS, PLACEHOLDER_EMAILS
 
@@ -40,6 +46,9 @@ async def get_stats(
     # for 6 separate cold connections.  The 30 s Redis cache means this path
     # is hit at most once per 30 s anyway.
 
+    tenant_id = current_user.tenant_id
+    tenant_filter = Job.tenant_id == tenant_id
+
     # Build blacklist filter subquery once (mirrors jobs.py _apply_job_filters logic)
     # This ensures dashboard counts match job page counts
     job_co_lower = func.lower(Job.company)
@@ -49,11 +58,12 @@ async def get_stats(
 
     blacklist_filter = ~exists(
         select(BlacklistedCompany.id).where(
+            BlacklistedCompany.tenant_id.in_((tenant_id, SENTINEL_TENANT_ID)),
             or_(
-                job_co_lower.like(func.concat("%", bl_lower, "%")),
-                bl_lower.like(func.concat("%", job_co_lower, "%")),
-                job_co_nospace.like(func.concat("%", bl_nospace, "%")),
-                bl_nospace.like(func.concat("%", job_co_nospace, "%")),
+                job_co_lower.like(literal("%") + bl_lower + literal("%")),
+                bl_lower.like(literal("%") + job_co_lower + literal("%")),
+                job_co_nospace.like(literal("%") + bl_nospace + literal("%")),
+                bl_nospace.like(literal("%") + job_co_nospace + literal("%")),
             )
         )
     )
@@ -62,20 +72,20 @@ async def get_stats(
     candidate_filters = [Job.candidate_id == candidate_id] if candidate_id else []
 
     total_result = await db.execute(
-        select(func.count(Job.id)).where(blacklist_filter, *candidate_filters)
+        select(func.count(Job.id)).where(tenant_filter, blacklist_filter, *candidate_filters)
     )
     total_jobs = total_result.scalar() or 0
 
     status_result = await db.execute(
         select(Job.status, func.count(Job.id))
-        .where(blacklist_filter, *candidate_filters)
+        .where(tenant_filter, blacklist_filter, *candidate_filters)
         .group_by(Job.status)
     )
     jobs_by_status = {row[0]: row[1] for row in status_result.all()}
 
     portal_result = await db.execute(
         select(Job.source_portal, func.count(Job.id))
-        .where(blacklist_filter, *candidate_filters)
+        .where(tenant_filter, blacklist_filter, *candidate_filters)
         .group_by(Job.source_portal)
     )
     jobs_by_portal = {row[0]: row[1] for row in portal_result.all()}
@@ -84,12 +94,17 @@ async def get_stats(
         email_q = (
             select(SendLog.status, func.count(SendLog.id))
             .join(Job, SendLog.job_id == Job.id)
-            .where(Job.candidate_id == candidate_id)
+            .where(
+                SendLog.tenant_id == tenant_id,
+                Job.tenant_id == tenant_id,
+                Job.candidate_id == candidate_id,
+            )
             .group_by(SendLog.status)
         )
     else:
         email_q = (
             select(SendLog.status, func.count(SendLog.id))
+            .where(SendLog.tenant_id == tenant_id)
             .group_by(SendLog.status)
         )
     email_result = await db.execute(email_q)
@@ -98,14 +113,14 @@ async def get_stats(
     cover_result = await db.execute(
         select(func.count(Job.id))
         .where(Job.cover_letter.isnot(None))
-        .where(blacklist_filter, *candidate_filters)
+        .where(tenant_filter, blacklist_filter, *candidate_filters)
     )
     cover_letters = cover_result.scalar() or 0
 
     hr_result = await db.execute(
         select(func.count(Job.id))
         .where(Job.hr_email.isnot(None))
-        .where(blacklist_filter, *candidate_filters)
+        .where(tenant_filter, blacklist_filter, *candidate_filters)
     )
     jobs_with_hr = hr_result.scalar() or 0
 
@@ -126,6 +141,7 @@ async def get_stats(
     ]
     ready_result = await db.execute(
         select(func.count(Job.id))
+        .where(tenant_filter)
         .where(Job.status == "cover_generated")
         .where(Job.hr_email.isnot(None))
         .where(*placeholder_domain_filters)
@@ -138,6 +154,7 @@ async def get_stats(
     # Missing HR email = scraped/scored/cover_generated but hr_email is NULL
     missing_hr_result = await db.execute(
         select(func.count(Job.id))
+        .where(tenant_filter)
         .where(Job.hr_email.is_(None))
         .where(Job.status.notin_(["filtered", "sent", "bounced", "error"]))
         .where(blacklist_filter, *candidate_filters)
@@ -147,6 +164,7 @@ async def get_stats(
     # HR unreachable = discovery attempts exhausted
     unreachable_result = await db.execute(
         select(func.count(Job.id))
+        .where(tenant_filter)
         .where(Job.hr_email_discovery_status == "unreachable")
         .where(blacklist_filter, *candidate_filters)
     )
@@ -155,6 +173,7 @@ async def get_stats(
     # Pending approval = has cover + HR email but waiting on manual review
     pending_result = await db.execute(
         select(func.count(Job.id))
+        .where(tenant_filter)
         .where(Job.status == "pending_approval")
         .where(blacklist_filter, *candidate_filters)
     )
@@ -200,8 +219,10 @@ async def get_hr_email_pipeline_stats(
     cover-ready bottleneck, and circuit breaker state from Redis.
     """
     # Discovery status counts
+    tenant_filter = Job.tenant_id == current_user.tenant_id
     status_result = await db.execute(
         select(Job.hr_email_discovery_status, func.count(Job.id))
+        .where(tenant_filter)
         .where(Job.status.notin_(["filtered"]))
         .group_by(Job.hr_email_discovery_status)
     )
@@ -210,6 +231,7 @@ async def get_hr_email_pipeline_stats(
     # Cover-ready bottleneck
     cover_missing = await db.execute(
         select(func.count(Job.id))
+        .where(tenant_filter)
         .where(Job.status == "cover_generated")
         .where(Job.hr_email.is_(None))
     )
@@ -217,6 +239,7 @@ async def get_hr_email_pipeline_stats(
 
     cover_with = await db.execute(
         select(func.count(Job.id))
+        .where(tenant_filter)
         .where(Job.status == "cover_generated")
         .where(Job.hr_email.isnot(None))
     )
@@ -225,6 +248,7 @@ async def get_hr_email_pipeline_stats(
     # Portal breakdown for cover_ready missing HR
     portal_result = await db.execute(
         select(Job.source_portal, func.count(Job.id))
+        .where(tenant_filter)
         .where(Job.status == "cover_generated")
         .where(Job.hr_email.is_(None))
         .group_by(Job.source_portal)

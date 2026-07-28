@@ -321,15 +321,20 @@ def _is_relevant_job(job_data: dict) -> tuple[bool, bool]:
     return False, False
 
 
-async def _save_job(job_data: dict, candidate_id: str | None) -> str | None:
+async def _save_job(
+    job_data: dict,
+    candidate_id: str | None,
+    tenant_id: str | None = None,
+) -> str | None:
     """Insert a single job into DB, skip duplicates. Returns job_id or None."""
-    saved_ids = await _save_jobs_batch([job_data], candidate_id)
+    saved_ids = await _save_jobs_batch([job_data], candidate_id, tenant_id)
     return saved_ids[0] if saved_ids else None
 
 
 async def _save_jobs_batch(
     jobs_data: list[dict],
     candidate_id: str | None,
+    tenant_id: str | None = None,
 ) -> list[str]:
     """Bulk-insert jobs into DB, skipping duplicates and irrelevant jobs.
 
@@ -351,7 +356,7 @@ async def _save_jobs_batch(
         is_company_blacklisted,
     )
     from services.api.core.database import get_worker_session_factory
-    from services.api.models.db import Job
+    from services.api.models.db import Candidate, Job, SENTINEL_TENANT_ID
 
     # ── Stage 1: In-memory relevance filter (no DB work) ──────────────────
     relevant: list[dict] = []
@@ -432,8 +437,31 @@ async def _save_jobs_batch(
 
     session_factory = get_worker_session_factory()
     async with session_factory() as session:
+        effective_tenant_id = tenant_id
+        if candidate_id:
+            candidate_tenant = await session.scalar(
+                select(Candidate.tenant_id).where(Candidate.id == candidate_id)
+            )
+            if candidate_tenant is None:
+                logger.warning(
+                    "jobs_batch_skipped_candidate_not_found",
+                    candidate_id=candidate_id,
+                    requested_tenant_id=tenant_id,
+                )
+                return []
+            if effective_tenant_id and candidate_tenant != effective_tenant_id:
+                logger.error(
+                    "jobs_batch_skipped_tenant_mismatch",
+                    candidate_id=candidate_id,
+                    candidate_tenant_id=candidate_tenant,
+                    requested_tenant_id=effective_tenant_id,
+                )
+                return []
+            effective_tenant_id = candidate_tenant
+        effective_tenant_id = effective_tenant_id or SENTINEL_TENANT_ID
+
         # ── Stage 2: Blacklist filter (single query) ──────────────────────
-        blacklist = await get_blacklisted_names(session)
+        blacklist = await get_blacklisted_names(session, effective_tenant_id)
         filtered: list[dict] = []
         for jd in fresh:
             company = (jd.get("company") or "").strip()
@@ -447,7 +475,10 @@ async def _save_jobs_batch(
         # ── Stage 3: Dedupe check (single query for all hashes) ───────────
         hashes = [jd["dedupe_hash"] for jd in filtered]
         existing_result = await session.execute(
-            select(Job.dedupe_hash).where(Job.dedupe_hash.in_(hashes))
+            select(Job.dedupe_hash).where(
+                Job.tenant_id == effective_tenant_id,
+                Job.dedupe_hash.in_(hashes),
+            )
         )
         existing_hashes = {row[0] for row in existing_result.all()}
 
@@ -458,6 +489,7 @@ async def _save_jobs_batch(
                 continue
             new_jobs.append(Job(
                 id=str(uuid.uuid4()),
+                tenant_id=effective_tenant_id,
                 candidate_id=candidate_id,
                 job_title=jd["job_title"],
                 company=jd["company"],
@@ -508,6 +540,7 @@ async def _save_jobs_batch(
                 try:
                     job = Job(
                         id=str(uuid.uuid4()),
+                        tenant_id=effective_tenant_id,
                         candidate_id=candidate_id,
                         job_title=jd["job_title"],
                         company=jd["company"],
@@ -553,6 +586,7 @@ async def _get_active_candidates() -> list[dict]:
         return [
             {
                 "id": c.id,
+                "tenant_id": c.tenant_id,
                 "target_roles": c.target_roles or [],
                 "target_locations": c.target_locations or [],
             }
@@ -639,6 +673,7 @@ def scrape_portal_task(
     portal: str,
     query_dict: dict,
     candidate_id: str | None = None,
+    tenant_id: str | None = None,
     auto_generate_covers: bool = False,
     search_task_id: str | None = None,
 ) -> dict:
@@ -653,7 +688,13 @@ def scrape_portal_task(
         task_name=self.name,
         worker_id=self.request.hostname,
     )
-    logger.info("scrape_task_started", portal=portal, query=query_dict)
+    logger.info(
+        "scrape_task_started",
+        portal=portal,
+        query=query_dict,
+        candidate_id=candidate_id,
+        tenant_id=tenant_id,
+    )
 
     registry = get_adapter_registry()
     if portal not in registry:
@@ -691,7 +732,7 @@ def scrape_portal_task(
 
         # Stage 2: pre-dedupe — drop jobs whose dedupe_hash already exists in DB
         # BEFORE we pay the cost of a detail fetch. Single query, big savings.
-        new_raw_jobs = await _filter_unseen_jobs(raw_jobs)
+        new_raw_jobs = await _filter_unseen_jobs(raw_jobs, tenant_id)
         dedup_dropped = len(raw_jobs) - len(new_raw_jobs)
         if not new_raw_jobs:
             logger.info(
@@ -714,7 +755,10 @@ def scrape_portal_task(
             payload = _raw_job_to_payload(rj)
             (complete if rj.job_description else needs_detail).append(payload)
 
-        saved_job_ids = await _save_jobs_batch(complete, candidate_id) if complete else []
+        saved_job_ids = (
+            await _save_jobs_batch(complete, candidate_id, tenant_id)
+            if complete else []
+        )
 
         # Stage 4: fan out detail fetches as individual tasks.
         # Backpressure: detail tasks drain far slower than discovery produces
@@ -740,6 +784,7 @@ def scrape_portal_task(
                 bp.add(scrape_job_detail_task.s(
                     raw_job_payload=payload,
                     candidate_id=candidate_id,
+                    tenant_id=tenant_id,
                     auto_generate_covers=auto_generate_covers,
                 ))
             bp.flush_with_stagger(base_countdown=1, stagger_seconds=0.05)
@@ -853,7 +898,7 @@ def _payload_to_job_data(payload: dict) -> dict:
     return out
 
 
-async def _filter_unseen_jobs(raw_jobs: list) -> list:
+async def _filter_unseen_jobs(raw_jobs: list, tenant_id: str | None = None) -> list:
     """Return only RawJobs whose dedupe_hash is not already in the DB.
 
     Single SELECT for the whole batch — cheap. Saves expensive detail fetches
@@ -863,7 +908,7 @@ async def _filter_unseen_jobs(raw_jobs: list) -> list:
         return []
     from sqlalchemy import select
     from services.api.core.database import get_worker_session_factory
-    from services.api.models.db import Job
+    from services.api.models.db import Job, SENTINEL_TENANT_ID
 
     hashes = [rj.dedupe_hash for rj in raw_jobs if rj.dedupe_hash]
     if not hashes:
@@ -872,13 +917,16 @@ async def _filter_unseen_jobs(raw_jobs: list) -> list:
     session_factory = get_worker_session_factory()
     async with session_factory() as session:
         result = await session.execute(
-            select(Job.dedupe_hash).where(Job.dedupe_hash.in_(hashes))
+            select(Job.dedupe_hash).where(
+                Job.tenant_id == (tenant_id or SENTINEL_TENANT_ID),
+                Job.dedupe_hash.in_(hashes),
+            )
         )
         existing = {row[0] for row in result.all()}
     return [rj for rj in raw_jobs if rj.dedupe_hash not in existing]
 
 
-async def _job_exists(dedupe_hash: str) -> bool:
+async def _job_exists(dedupe_hash: str, tenant_id: str | None = None) -> bool:
     """True when a job with this dedupe_hash is already saved.
 
     Detail tasks can sit in jh_scraping_detail for days; the job may have been
@@ -887,12 +935,15 @@ async def _job_exists(dedupe_hash: str) -> bool:
     """
     from sqlalchemy import select
     from services.api.core.database import get_worker_session_factory
-    from services.api.models.db import Job
+    from services.api.models.db import Job, SENTINEL_TENANT_ID
 
     session_factory = get_worker_session_factory()
     async with session_factory() as session:
         result = await session.execute(
-            select(Job.id).where(Job.dedupe_hash == dedupe_hash).limit(1)
+            select(Job.id).where(
+                Job.tenant_id == (tenant_id or SENTINEL_TENANT_ID),
+                Job.dedupe_hash == dedupe_hash,
+            ).limit(1)
         )
         return result.first() is not None
 
@@ -908,6 +959,7 @@ def scrape_job_detail_task(
     self,
     raw_job_payload: dict,
     candidate_id: str | None = None,
+    tenant_id: str | None = None,
     auto_generate_covers: bool = False,
 ) -> dict:
     """Fetch the detail page for one job, persist it, dispatch downstream tasks.
@@ -935,7 +987,7 @@ def scrape_job_detail_task(
     async def _run() -> int:
         job_data = _payload_to_job_data(raw_job_payload)
         dedupe_hash = job_data.get("dedupe_hash")
-        if dedupe_hash and await _job_exists(dedupe_hash):
+        if dedupe_hash and await _job_exists(dedupe_hash, tenant_id):
             logger.info("detail_task_skipped_existing", url=url, portal=portal)
             return 0
         if not job_data.get("job_description"):
@@ -950,7 +1002,7 @@ def scrape_job_detail_task(
             except Exception as exc:
                 logger.warning("detail_fetch_failed", url=url, error=str(exc))
 
-        saved_ids = await _save_jobs_batch([job_data], candidate_id)
+        saved_ids = await _save_jobs_batch([job_data], candidate_id, tenant_id)
         if saved_ids:
             from services.ai.tasks import generate_embedding_task, score_job_task
             bp = BatchPublisher(chunk_size=10)
@@ -1225,7 +1277,7 @@ def mnc_scrape_company_task(
             for j in raw_jobs
         ]
 
-        saved_job_ids = await _save_jobs_batch(job_data_list, candidate_id)
+        saved_job_ids = await _save_jobs_batch(job_data_list, candidate_id, tenant_id)
         saved_count = len(saved_job_ids)
 
         # Dispatch downstream immediately — no need to wait for the chord callback.
@@ -1470,6 +1522,7 @@ def scheduled_scrape() -> dict:
         roles = candidate.get("target_roles") or []
         locations = candidate.get("target_locations") or ["India"]
         candidate_id = candidate["id"]
+        tenant_id = candidate["tenant_id"]
 
         for role in roles:
             for loc in locations:
@@ -1482,6 +1535,7 @@ def scheduled_scrape() -> dict:
                             "max_results": 100,
                         },
                         candidate_id=candidate_id,
+                        tenant_id=tenant_id,
                         auto_generate_covers=True,
                     ))
                     tasks_dispatched += 1
@@ -2265,7 +2319,6 @@ def backfill_hr_emails_task() -> dict:
 
         session_factory = get_worker_session_factory()
         async with session_factory() as session:
-            blacklist = await get_blacklisted_names(session)
             # Priority: cover_generated (blocked on sending) → current-month → rest.
             # Within each tier, fewest attempts first (new jobs ahead of repeatedly-failed).
             result = await session.execute(
@@ -2294,9 +2347,17 @@ def backfill_hr_emails_task() -> dict:
             )
             jobs = result.scalars().all()
 
+            blacklists_by_tenant = {
+                tenant: await get_blacklisted_names(session, str(tenant))
+                for tenant in {job.tenant_id for job in jobs}
+            }
+
         # Filter out blacklisted companies - don't waste email-discovery API calls on them
         jobs = [
-            j for j in jobs if not is_company_blacklisted(j.company or "", blacklist)
+            j for j in jobs
+            if not is_company_blacklisted(
+                j.company or "", blacklists_by_tenant.get(j.tenant_id, frozenset())
+            )
         ]
         logger.info("backfill_jobs_fetched", count=len(jobs))
 
@@ -2496,7 +2557,6 @@ def fix_placeholder_emails_task() -> dict:
 
         session_factory = get_worker_session_factory()
         async with session_factory() as session:
-            blacklist = await get_blacklisted_names(session)
             result = await session.execute(
                 select(Job)
                 .where(or_(*domain_filters, *exact_filters, *image_filters))
@@ -2506,8 +2566,16 @@ def fix_placeholder_emails_task() -> dict:
             )
             jobs = result.scalars().all()
 
+            blacklists_by_tenant = {
+                tenant: await get_blacklisted_names(session, str(tenant))
+                for tenant in {job.tenant_id for job in jobs}
+            }
+
         jobs = [
-            j for j in jobs if not is_company_blacklisted(j.company or "", blacklist)
+            j for j in jobs
+            if not is_company_blacklisted(
+                j.company or "", blacklists_by_tenant.get(j.tenant_id, frozenset())
+            )
         ]
         logger.info("fix_placeholder_emails_fetched", count=len(jobs))
 
@@ -2741,7 +2809,7 @@ def cleanup_old_jobs_task() -> dict:
 
     Deletes orphaned embeddings rows for cleaned-up jobs.
     Leaves send_logs intact (audit trail).
-    Terminal statuses: sent, bounced, ignored, error.
+    Terminal statuses: sent, bounced, error.
     """
     DAYS_OLD = 30
     TERMINAL_STATUSES = ("sent", "bounced", "error")
@@ -2980,7 +3048,7 @@ def pipeline_health_check_task() -> dict:
     Checks:
     - Jobs stuck in 'scoring' status > 1 hour → reset to 'filtered' for retry
     - Count of send-ready jobs (cover_generated + hr_email set) — metric only
-    - Jobs in 'pending_approval' > 24h → auto-approve when AUTO_SEND_ENABLED=True
+    - Count jobs in 'pending_approval' > 24h for operator visibility
     """
     logger.info("pipeline_health_check_started")
 
@@ -2989,11 +3057,9 @@ def pipeline_health_check_task() -> dict:
 
         from sqlalchemy import func, select, update as sa_update
 
-        from services.api.core.config import get_settings
         from services.api.core.database import get_worker_session_factory
         from services.api.models.db import Job
 
-        settings = get_settings()
         session_factory = get_worker_session_factory()
         fixes: dict = {}
         now = _utcnow()
@@ -3019,18 +3085,16 @@ def pipeline_health_check_task() -> dict:
             )
             fixes["send_ready_count"] = send_ready or 0
 
-            # Fix 3: Auto-approve pending_approval > 24h (only when AUTO_SEND_ENABLED)
-            auto_approved = 0
-            if getattr(settings, "auto_send_enabled", False):
-                r = await session.execute(
-                    sa_update(Job)
-                    .where(Job.status == "pending_approval")
-                    .where(Job.updated_at < now - timedelta(hours=24))
-                    .values(status="approved")
-                    .execution_options(synchronize_session=False),
+            # Metric only: the dedicated auto_approve_pending_jobs_task owns
+            # dispatch. Writing the unsupported status "approved" here used to
+            # orphan jobs outside every normal sender query.
+            stale_pending = await session.scalar(
+                select(func.count()).select_from(Job).where(
+                    Job.status == "pending_approval",
+                    Job.updated_at < now - timedelta(hours=24),
                 )
-                auto_approved = r.rowcount
-            fixes["auto_approved"] = auto_approved
+            )
+            fixes["stale_pending_approval_count"] = stale_pending or 0
 
             # Fix 4: selector-rot signal — portals returning 0 jobs across
             # several consecutive scheduled scrapes (selectors rotted / blocked).
@@ -3279,7 +3343,7 @@ def consulting_scrape_company_task(
             for j in raw_jobs
         ]
 
-        saved_job_ids = await _save_jobs_batch(job_data_list, candidate_id)
+        saved_job_ids = await _save_jobs_batch(job_data_list, candidate_id, tenant_id)
         saved_count = len(saved_job_ids)
 
         if saved_job_ids:

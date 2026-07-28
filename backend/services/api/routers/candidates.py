@@ -14,7 +14,6 @@ from services.api.core.dependencies import get_current_user
 from services.api.models.db import Candidate, User
 from services.api.schemas.schemas import CandidateCreate, CandidateOut, CandidateUpdate
 
-_CANDIDATES_CACHE_KEY = "candidates:active"
 _CANDIDATES_TTL = 300  # 5 minutes — candidates rarely change
 
 router = APIRouter(prefix="/candidates", tags=["candidates"])
@@ -22,36 +21,51 @@ Auth = Annotated[User, Depends(get_current_user)]
 
 
 @router.post("", response_model=CandidateOut, status_code=status.HTTP_201_CREATED)
-async def create_candidate(body: CandidateCreate, _: Auth, db: AsyncSession = Depends(get_db)):
+async def create_candidate(body: CandidateCreate, current_user: Auth, db: AsyncSession = Depends(get_db)):
     # Check duplicate email
-    existing = await db.execute(select(Candidate).where(Candidate.email == body.email))
+    existing = await db.execute(
+        select(Candidate).where(
+            Candidate.email == body.email,
+            Candidate.tenant_id == current_user.tenant_id,
+        )
+    )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Candidate with this email already exists")
 
-    candidate = Candidate(id=str(uuid.uuid4()), **body.model_dump())
+    candidate = Candidate(
+        id=str(uuid.uuid4()),
+        tenant_id=current_user.tenant_id,
+        **body.model_dump(),
+    )
     db.add(candidate)
     await db.flush()
     await db.refresh(candidate)
-    await cache_delete(_CANDIDATES_CACHE_KEY)
+    await cache_delete(f"candidates:active:{current_user.tenant_id}")
     return candidate
 
 
 @router.get("", response_model=list[CandidateOut])
-async def list_candidates(_: Auth, db: AsyncSession = Depends(get_db)):
+async def list_candidates(current_user: Auth, db: AsyncSession = Depends(get_db)):
     # Serve from cache — candidates rarely change, called on every page load
-    cached = await cache_get(_CANDIDATES_CACHE_KEY)
+    cache_key = f"candidates:active:{current_user.tenant_id}"
+    cached = await cache_get(cache_key)
     if cached is not None:
         return [CandidateOut(**c) for c in cached]
 
     result = await db.execute(
-        select(Candidate).where(Candidate.is_active == True).order_by(Candidate.created_at.desc())  # noqa
+        select(Candidate)
+        .where(
+            Candidate.tenant_id == current_user.tenant_id,
+            Candidate.is_active == True,  # noqa: E712
+        )
+        .order_by(Candidate.created_at.desc())
     )
     candidates = result.scalars().all()
 
     import asyncio
     asyncio.ensure_future(
         cache_set(
-            _CANDIDATES_CACHE_KEY,
+            cache_key,
             [CandidateOut.model_validate(c).model_dump() for c in candidates],
             _CANDIDATES_TTL,
         )
@@ -60,25 +74,25 @@ async def list_candidates(_: Auth, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/{candidate_id}", response_model=CandidateOut)
-async def get_candidate(candidate_id: str, _: Auth, db: AsyncSession = Depends(get_db)):
+async def get_candidate(candidate_id: str, current_user: Auth, db: AsyncSession = Depends(get_db)):
     candidate = await db.get(Candidate, candidate_id)
-    if not candidate:
+    if not candidate or candidate.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Candidate not found")
     return candidate
 
 
 @router.put("/{candidate_id}", response_model=CandidateOut)
 async def update_candidate(
-    candidate_id: str, body: CandidateUpdate, _: Auth, db: AsyncSession = Depends(get_db)
+    candidate_id: str, body: CandidateUpdate, current_user: Auth, db: AsyncSession = Depends(get_db)
 ):
     candidate = await db.get(Candidate, candidate_id)
-    if not candidate:
+    if not candidate or candidate.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Candidate not found")
     for field, value in body.model_dump(exclude_none=True).items():
         setattr(candidate, field, value)
     await db.flush()
     await db.refresh(candidate)
-    await cache_delete(_CANDIDATES_CACHE_KEY)
+    await cache_delete(f"candidates:active:{current_user.tenant_id}")
     return candidate
 
 
@@ -89,13 +103,13 @@ _MAX_RESUME_BYTES = 5 * 1024 * 1024
 @router.post("/{candidate_id}/resume", response_model=CandidateOut)
 async def upload_resume(
     candidate_id: str,
-    _: Auth,
+    current_user: Auth,
     db: AsyncSession = Depends(get_db),
     file: UploadFile = File(...),
 ):
     """Upload a PDF resume for a candidate. Saves to backend/resumes/ and updates resume_url."""
     candidate = await db.get(Candidate, candidate_id)
-    if not candidate:
+    if not candidate or candidate.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -108,8 +122,9 @@ async def upload_resume(
         raise HTTPException(status_code=422, detail="File is not a valid PDF")
 
     # Derive a clean filename from the candidate name
-    safe_name = candidate.name.lower().replace(" ", "-")
-    filename = f"{safe_name}-resume.pdf"
+    # Include the immutable candidate id so equal names across tenants cannot
+    # overwrite each other's resume files.
+    filename = f"{candidate.id}-resume.pdf"
 
     _RESUMES_DIR.mkdir(parents=True, exist_ok=True)
     dest = _RESUMES_DIR / filename
@@ -118,19 +133,19 @@ async def upload_resume(
     candidate.resume_url = f"resumes/{filename}"
     await db.flush()
     await db.refresh(candidate)
-    await cache_delete(_CANDIDATES_CACHE_KEY)
+    await cache_delete(f"candidates:active:{current_user.tenant_id}")
     return candidate
 
 
 @router.get("/{candidate_id}/resume")
 async def download_resume(
     candidate_id: str,
-    _: Auth,
+    current_user: Auth,
     db: AsyncSession = Depends(get_db),
 ):
     """Download the resume PDF for a candidate."""
     candidate = await db.get(Candidate, candidate_id)
-    if not candidate:
+    if not candidate or candidate.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Candidate not found")
     if not candidate.resume_url:
         raise HTTPException(status_code=404, detail="No resume uploaded for this candidate")

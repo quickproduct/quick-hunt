@@ -21,7 +21,7 @@ Auth = Annotated[User, Depends(get_current_user)]
 
 
 @router.post("", response_model=SearchResponse)
-async def trigger_search(body: SearchRequest, _: Auth, db: AsyncSession = Depends(get_db)):
+async def trigger_search(body: SearchRequest, current_user: Auth, db: AsyncSession = Depends(get_db)):
     # Validate portals
     invalid = [p for p in body.portals if p not in VALID_PORTALS]
     if invalid:
@@ -32,12 +32,13 @@ async def trigger_search(body: SearchRequest, _: Auth, db: AsyncSession = Depend
 
     # Verify candidate exists
     candidate = await db.get(Candidate, body.candidate_id)
-    if not candidate:
+    if not candidate or candidate.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     search_task_id = str(uuid.uuid4())
     search_task = SearchTask(
         id=search_task_id,
+        tenant_id=current_user.tenant_id,
         candidate_id=body.candidate_id,
         job_titles=body.job_titles,
         locations=body.locations,
@@ -64,6 +65,7 @@ async def trigger_search(body: SearchRequest, _: Auth, db: AsyncSession = Depend
                             "max_results": body.max_results_per_portal,
                         },
                         "candidate_id": body.candidate_id,
+                        "tenant_id": current_user.tenant_id,
                         "auto_generate_covers": body.auto_generate_covers,
                         "search_task_id": search_task_id,
                     },
@@ -90,18 +92,21 @@ async def trigger_search(body: SearchRequest, _: Auth, db: AsyncSession = Depend
 
 @router.get("/tasks", response_model=list[SearchTaskOut])
 async def list_search_tasks(
-    _: Auth,
+    current_user: Auth,
     db: AsyncSession = Depends(get_db),
     limit: int = Query(default=10, ge=1, le=100),
 ):
     """List recent search tasks, newest first."""
-    cache_key = f"search_tasks:list:{limit}"
+    cache_key = f"search_tasks:list:{current_user.tenant_id}:{limit}"
     cached = await cache_get(cache_key)
     if cached is not None:
         return [SearchTaskOut(**t) for t in cached]
 
     result = await db.execute(
-        select(SearchTask).order_by(SearchTask.created_at.desc()).limit(limit)
+        select(SearchTask)
+        .where(SearchTask.tenant_id == current_user.tenant_id)
+        .order_by(SearchTask.created_at.desc())
+        .limit(limit)
     )
     tasks = result.scalars().all()
     asyncio.ensure_future(
@@ -111,8 +116,8 @@ async def list_search_tasks(
 
 
 @router.get("/tasks/{task_id}", response_model=SearchTaskOut)
-async def get_search_task(task_id: str, _: Auth, db: AsyncSession = Depends(get_db)):
+async def get_search_task(task_id: str, current_user: Auth, db: AsyncSession = Depends(get_db)):
     task = await db.get(SearchTask, task_id)
-    if not task:
+    if not task or task.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Search task not found")
     return task

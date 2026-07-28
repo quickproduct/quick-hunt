@@ -274,19 +274,22 @@ celery_app.conf.update(
             "task": "services.scraper.tasks.purge_old_cron_runs_task",
             "schedule": 86400,  # once per day
         },
-        # ── DISABLED — auto-send off globally (AUTO_SEND_ENABLED=False) ──────
+        # ── Automatic sends ─────────────────────────────────────────────────
+        # These tasks self-guard on AUTO_SEND_ENABLED and tenant.auto_send, so
+        # keeping the schedules active makes the configuration switch truthful
+        # while remaining a no-op under the safe default (False).
         # "retry-failed-sends-every-30min": {
         #     "task": "services.sender.tasks.retry_failed_sends_task",
         #     "schedule": settings.beat_retry_sends_interval,
         # },
-        # "dispatch-ready-to-send-every-5min": {
-        #     "task": "services.sender.tasks.dispatch_ready_to_send_task",
-        #     "schedule": settings.beat_dispatch_ready_interval,
-        # },
-        # "auto-approve-pending-every-10min": {
-        #     "task": "services.sender.tasks.auto_approve_pending_jobs_task",
-        #     "schedule": settings.beat_auto_approve_interval,
-        # },
+        "dispatch-ready-to-send-every-5min": {
+            "task": "services.sender.tasks.dispatch_ready_to_send_task",
+            "schedule": settings.beat_dispatch_ready_interval,
+        },
+        "auto-approve-pending-every-10min": {
+            "task": "services.sender.tasks.auto_approve_pending_jobs_task",
+            "schedule": settings.beat_auto_approve_interval,
+        },
     },
 )
 

@@ -41,11 +41,30 @@ env_value() {
   grep -E "^${key}=" "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true
 }
 
+validate_env() {
+  local key value
+  for key in ADMIN_API_KEY SECRET_KEY DATABASE_URL RABBITMQ_URL; do
+    value="$(env_value "$key")"
+    [[ -n "$value" ]] || die "$key is required in $ENV_FILE"
+    if [[ "$value" == *CHANGE_ME* || "$value" == *change-me* || "$value" == your_generated_* ]]; then
+      die "$key still contains a placeholder value"
+    fi
+  done
+
+  value="$(env_value INITIAL_ADMIN_PASSWORD)"
+  if [[ -n "$value" ]]; then
+    [[ "$value" != *CHANGE_ME* && "$value" != *change-me* ]] || \
+      die "INITIAL_ADMIN_PASSWORD still contains a placeholder value"
+    [[ ${#value} -ge 16 ]] || die "INITIAL_ADMIN_PASSWORD must be at least 16 characters"
+  fi
+}
+
 create_secret_from_env() {
   log "Creating Kubernetes secrets from $ENV_FILE..."
 
   local tmpenv rmq_url rmq_pass rmq_user db_url db_pass
   tmpenv="$(mktemp)"
+  trap 'rm -f "$tmpenv"' RETURN
   grep -v '^#' "$ENV_FILE" | grep -v '^[[:space:]]*$' | grep '=' | \
     grep -v '^LOG_TO_FILE=' | \
     grep -v '^LOG_DIR=' | \
@@ -78,6 +97,7 @@ create_secret_from_env() {
     --dry-run=client -o yaml | kubectl apply -f -
 
   rm -f "$tmpenv"
+  trap - RETURN
 }
 
 build_image() {
@@ -102,15 +122,10 @@ import_image() {
 }
 
 build_and_import_images() {
-  local admin_key
-  admin_key="$(env_value NEXT_PUBLIC_ADMIN_API_KEY)"
-  admin_key="${admin_key:-change-me}"
-
   build_image "jh-api" "$REPO_ROOT/infra/Dockerfile.api"
   build_image "jh-worker-lightweight" "$REPO_ROOT/infra/Dockerfile.worker.lightweight"
   build_image "jh-worker-playwright" "$REPO_ROOT/infra/Dockerfile.worker"
-  build_image "jh-dashboard" "$REPO_ROOT/infra/Dockerfile.dashboard" \
-    --build-arg "NEXT_PUBLIC_ADMIN_API_KEY=${admin_key}"
+  build_image "jh-dashboard" "$REPO_ROOT/infra/Dockerfile.dashboard"
 
   for image in jh-api jh-worker-lightweight jh-worker-playwright jh-dashboard; do
     import_image "$image"
@@ -204,13 +219,53 @@ deploy_cluster() {
   $K rollout status deployment/api --timeout=180s
   $K rollout status deployment/dashboard --timeout=180s
   $K rollout status deployment/beat --timeout=180s
+
+  log "Waiting for active worker rollouts..."
+  local deployment desired
+  while IFS= read -r deployment; do
+    desired="$($K get deployment "$deployment" -o jsonpath='{.spec.replicas}')"
+    if [[ "${desired:-0}" -gt 0 ]]; then
+      $K rollout status "deployment/$deployment" --timeout=240s
+    fi
+  done < <($K get deployments -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+}
+
+verify_cluster() {
+  log "Verifying deployed revision ${IMAGE_TAG}..."
+
+  local unhealthy pod current_errors previous_errors restart_total
+  unhealthy="$($K get pods --no-headers | awk '$3 !~ /^(Running|Completed)$/ {print}')"
+  if [[ -n "$unhealthy" ]]; then
+    echo "$unhealthy" >&2
+    die "One or more pods are not Running or Completed."
+  fi
+
+  $K exec deployment/api -- python -c \
+    "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10)); assert data.get('status') in {'healthy', 'ok'}, data; print('API health:', data.get('status'))"
+
+  log "KEDA readiness and replica ceilings:"
+  $K get scaledobjects \
+    -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,ACTIVE:.status.conditions[?(@.type=="Active")].status,MIN:.spec.minReplicaCount,MAX:.spec.maxReplicaCount' || true
+
+  restart_total="$($K get pods -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{sum += $1} END {print sum + 0}')"
+  log "Current pod container restart total: $restart_total"
+
+  log "Scanning recent pod logs for high-signal runtime failures (counts only)..."
+  while IFS= read -r pod; do
+    current_errors="$($K logs "$pod" --all-containers --since=15m --tail=1000 2>/dev/null | grep -Eic 'Traceback|CRITICAL|panic:|SyntaxError|ModuleNotFoundError|ImportError|UnhandledPromiseRejection|FATAL' || true)"
+    previous_errors="$($K logs "$pod" --all-containers --previous --tail=500 2>/dev/null | grep -Eic 'Traceback|CRITICAL|panic:|SyntaxError|ModuleNotFoundError|ImportError|UnhandledPromiseRejection|FATAL' || true)"
+    printf 'log-scan pod=%s current_high_signal=%s previous_high_signal=%s\n' \
+      "$pod" "${current_errors:-0}" "${previous_errors:-0}"
+  done < <($K get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 }
 
 main() {
   cd "$REPO_ROOT"
   require_tools
+  validate_env
   build_and_import_images
   deploy_cluster
+  verify_cluster
 
   log "Deployment complete."
   kubectl get nodes -o wide

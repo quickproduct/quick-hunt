@@ -36,7 +36,7 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     dependencies=[Depends(rate_limit("login", max_requests=10, window_seconds=300))],
 )
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
-    return await auth_service.login(db, body.email, body.password)
+    return await auth_service.login(db, body.email, body.password, body.tenant_id)
 
 
 @router.post("/refresh", response_model=TokenResponse)

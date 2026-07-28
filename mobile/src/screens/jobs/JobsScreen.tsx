@@ -34,7 +34,7 @@ const PORTALS = [
 
 const STATUSES: JobStatus[] = [
   'new', 'scoring', 'filtered', 'pending_approval', 'cover_generated',
-  'sending', 'sent', 'applied', 'bounced', 'ignored', 'error',
+  'sending', 'sent', 'bounced', 'error',
 ];
 
 const JOB_TYPES = ['full-time', 'contract', 'part-time', 'internship'];

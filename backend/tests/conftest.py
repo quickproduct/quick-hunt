@@ -1,5 +1,4 @@
 """Pytest fixtures — async SQLite in-memory engine, sample data, async HTTP client."""
-import asyncio
 import os
 import uuid
 from typing import AsyncGenerator
@@ -24,16 +23,14 @@ from services.api.models.db import Candidate, Job
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create a session-scoped event loop."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture
 async def db_engine():
+    """Create an isolated database for each test.
+
+    Tests intentionally call commit(), so a session-scoped in-memory database
+    leaks committed rows into later tests; rolling back the session cannot undo
+    those commits. Per-test engines make test outcomes order-independent.
+    """
     engine = create_async_engine(TEST_DB_URL, echo=False)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -100,14 +97,23 @@ async def saved_job(db_session, sample_job_data, saved_candidate):
 
 
 @pytest_asyncio.fixture
-async def async_client():
+async def async_client(db_session):
     """httpx AsyncClient pointed at the FastAPI test app."""
     from httpx import AsyncClient, ASGITransport
     from services.api.main import app
+    from services.api.core.database import get_db
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test",
-        headers={"X-API-Key": "test-api-key"},
-    ) as client:
-        yield client
+    async def _override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"X-API-Key": "test-api-key"},
+        ) as client:
+            yield client
+    finally:
+        app.dependency_overrides.pop(get_db, None)

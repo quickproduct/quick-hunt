@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 # ------------------------------------------------------------------ #
 class CandidateCreate(BaseModel):
     name: str
-    email: str
+    email: EmailStr
     skills: list[str] = []
     years_experience: Optional[int] = None
     resume_url: Optional[str] = None
@@ -25,7 +25,7 @@ class CandidateCreate(BaseModel):
 
 class CandidateUpdate(BaseModel):
     name: Optional[str] = None
-    email: Optional[str] = None
+    email: Optional[EmailStr] = None
     skills: Optional[list[str]] = None
     years_experience: Optional[int] = None
     resume_url: Optional[str] = None
@@ -160,7 +160,7 @@ class HrEmailUpdate(BaseModel):
 
 class SendRequest(BaseModel):
     candidate_id: str
-    override_email: Optional[str] = None
+    override_email: Optional[EmailStr] = None
     override_subject: Optional[str] = None
     cover_letter: Optional[str] = None
     attach_resume: bool = True

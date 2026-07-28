@@ -7,7 +7,7 @@ import { ArrowLeft, ExternalLink, Mail, Sparkles, Send, Ban, Check, Clock } from
 import { formatDistanceToNow, format } from 'date-fns';
 import toast from 'react-hot-toast';
 import StatusBadge from '../../../components/StatusBadge';
-import { getJob, generateCoverLetter, updateJobStatus, getCandidates, getJobTimeline, type Job, type Candidate, type TimelineEvent } from '../../../lib/api';
+import { approveJob, getJob, generateCoverLetter, updateJobStatus, getCandidates, getJobTimeline, type Job, type Candidate, type TimelineEvent } from '../../../lib/api';
 import CoverLetterModal from '../../../components/CoverLetterModal';
 
 function ApplicationTimeline({ jobId }: { jobId: string }) {
@@ -94,6 +94,7 @@ export default function JobDetailPage() {
   const [selectedCandidate, setSelectedCandidate] = useState('');
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [approving, setApproving] = useState(false);
   const [showModal, setShowModal] = useState(false);
 
   useEffect(() => {
@@ -126,11 +127,24 @@ export default function JobDetailPage() {
 
   const handleIgnore = async () => {
     try {
-      await updateJobStatus(id, 'ignored');
+      await updateJobStatus(id, 'filtered');
       toast.success('Job ignored');
-      setJob(j => j ? { ...j, status: 'ignored' } : j);
+      setJob(j => j ? { ...j, status: 'filtered' } : j);
     } catch {
       toast.error('Failed to ignore job');
+    }
+  };
+
+  const handleApprove = async () => {
+    setApproving(true);
+    try {
+      await approveJob(id);
+      toast.success('Application approved and queued');
+      setJob(j => j ? { ...j, status: 'sending' } : j);
+    } catch {
+      toast.error('Failed to approve application');
+    } finally {
+      setApproving(false);
     }
   };
 
@@ -234,7 +248,17 @@ export default function JobDetailPage() {
           <Sparkles size={16} />
           {generating ? 'Queued...' : 'Generate Cover Letter'}
         </button>
-        {job.cover_letter && job.hr_email && (
+        {job.status === 'pending_approval' && job.cover_letter && job.hr_email && (
+          <button
+            onClick={handleApprove}
+            disabled={approving}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-green-600 text-white text-sm font-medium hover:bg-green-700 disabled:opacity-50"
+          >
+            <Check size={16} />
+            {approving ? 'Queuing...' : 'Approve & Send'}
+          </button>
+        )}
+        {job.status !== 'pending_approval' && job.cover_letter && job.hr_email && (
           <button
             onClick={() => setShowModal(true)}
             className="flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700"

@@ -160,7 +160,7 @@ function ForgotPasswordContent() {
           </div>
           <h1 className="text-3xl font-bold leading-snug">Reset password</h1>
           <p className="text-white/75 text-sm leading-relaxed max-w-xs">
-            Enter your email and we'll send you a link to reset your password
+            Enter your email and we&apos;ll send you a link to reset your password
           </p>
 
           {/* Step indicators */}
@@ -207,7 +207,7 @@ function ForgotPasswordContent() {
                       Forgot password?
                     </h2>
                     <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                      No worries, we'll send you reset instructions.
+                      No worries, we&apos;ll send you reset instructions.
                     </p>
                   </div>
 
@@ -307,7 +307,7 @@ function ForgotPasswordContent() {
                     )}
 
                     <p className="text-sm text-gray-500 dark:text-gray-400">
-                      Didn't receive the email?{' '}
+                      Didn&apos;t receive the email?{' '}
                       <button
                         type="button"
                         onClick={handleResend}

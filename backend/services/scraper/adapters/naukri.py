@@ -5,6 +5,7 @@ It returns structured JSON including job title, company, description, salary,
 and apply URL.  Requires appid/systemid headers but no authentication.
 """
 import math
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -110,19 +111,43 @@ class NaukriAdapter(BaseAdapter):
 
     def _parse_item(self, item: dict) -> Optional[RawJob]:
         try:
-            title = item.get("post", "").strip()
+            # Naukri has returned both field families over time: the live v2
+            # API uses post/city/urlStr, while cached and alternate responses
+            # use title/location/job_url. Accept both so a harmless response
+            # shape change does not silently drop every result.
+            title = str(item.get("post") or item.get("title") or "").strip()
             if not title:
+                logger.debug(
+                    "item_skipped_missing_title",
+                    portal=self.PORTAL_NAME,
+                    item_keys=sorted(item.keys()),
+                )
                 return None
 
-            company = item.get("companyName", "Unknown").strip()
-            city = item.get("city", "") or "India"
-            job_url = item.get("urlStr", "").strip()
-            description = item.get("jobDesc", "") or ""
+            company = str(item.get("companyName") or item.get("company") or "Unknown").strip()
+            city = str(item.get("city") or item.get("location") or "India").strip()
+            job_url = str(item.get("urlStr") or item.get("job_url") or "").strip()
+            if not job_url:
+                logger.debug(
+                    "item_skipped_missing_url",
+                    portal=self.PORTAL_NAME,
+                    title=title,
+                )
+                return None
+            description = str(item.get("jobDesc") or item.get("description") or "")
             keywords = item.get("keywords", "") or ""
 
             sal_min, sal_max, sal_cur = self._parse_salary(
                 item.get("minSal"), item.get("maxSal")
             )
+            if sal_min is None and sal_max is None:
+                salary_text = str(item.get("salary") or "")
+                salary_numbers = re.findall(r"\d+(?:\.\d+)?", salary_text.replace(",", ""))
+                if salary_numbers and re.search(r"lac|lakh", salary_text, re.IGNORECASE):
+                    sal_min, sal_max, sal_cur = self._parse_salary(
+                        salary_numbers[0],
+                        salary_numbers[1] if len(salary_numbers) > 1 else None,
+                    )
             posted_date = self._parse_date(item.get("addDate", ""))
 
             emails = extract_emails_from_text(description)
@@ -138,11 +163,19 @@ class NaukriAdapter(BaseAdapter):
                 salary_min=sal_min,
                 salary_max=sal_max,
                 salary_currency=sal_cur,
+                experience_required=(
+                    item.get("experience") or item.get("experienceText") or None
+                ),
                 posted_date=posted_date,
                 raw_data={"keywords": keywords},
             )
         except Exception as exc:
-            logger.warning("item_parse_error", portal=self.PORTAL_NAME, error=str(exc))
+            logger.warning(
+                "item_parse_error",
+                portal=self.PORTAL_NAME,
+                error=str(exc),
+                item_keys=sorted(item.keys()) if isinstance(item, dict) else [],
+            )
             return None
 
     async def parse_job_detail(self, url: str) -> Optional[RawJob]:

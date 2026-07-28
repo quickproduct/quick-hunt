@@ -16,18 +16,27 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
-async def get_blacklisted_names(session: "AsyncSession") -> frozenset[str]:
-    """Return all blacklisted company names as a lowercase frozenset.
+async def get_blacklisted_names(
+    session: "AsyncSession",
+    tenant_id: str | None = None,
+) -> frozenset[str]:
+    """Return applicable blacklisted company names as a lowercase frozenset.
 
-    Queries across ALL tenants so Celery workers (which have no tenant
-    context) still enforce the blacklist correctly.
+    Tenant-scoped operations include that tenant's entries plus the sentinel
+    tenant's global defaults. Without a tenant context, only global defaults
+    are returned; one tenant's private blacklist must never affect another.
 
     Call once per Celery task, not per-job, to minimise DB round-trips.
     """
     from sqlalchemy import select
-    from services.api.models.db import BlacklistedCompany
+    from services.api.models.db import BlacklistedCompany, SENTINEL_TENANT_ID
 
-    result = await session.execute(select(BlacklistedCompany.name))
+    tenant_ids = (SENTINEL_TENANT_ID, tenant_id) if tenant_id else (SENTINEL_TENANT_ID,)
+    result = await session.execute(
+        select(BlacklistedCompany.name).where(
+            BlacklistedCompany.tenant_id.in_(tenant_ids)
+        )
+    )
     return frozenset(row[0].lower() for row in result.all())
 
 

@@ -1181,7 +1181,7 @@ Optimised for a **4 CPU / 8 GB RAM VPS**:
 
 **`Dockerfile.dashboard`** (`node:20-alpine`, multi-stage):
 - Stages: deps → builder → runner
-- Build arg: `NEXT_PUBLIC_ADMIN_API_KEY`
+- Authentication uses per-user bearer tokens; platform API keys are never baked into client assets
 - Non-root `nextjs` user (uid 1001)
 - `next start` on port 3001
 

@@ -19,6 +19,7 @@ logger = structlog.get_logger(__name__)
 # potentially be re-applied to with a corrected email.
 _ACTIVE_SEND_STATUSES = frozenset({
     "queued",
+    "sending",
     "sent",
     "deferred",       # Brevo is retrying on its own — never create a new send
     "soft_bounced",   # our retry scheduled within cooldown window
@@ -53,6 +54,45 @@ def _mark_direct_send_failed(direct_send_log_id: str, exc: Exception) -> None:
             "direct_send_failed_status_update_failed",
             mark_exc,
             direct_send_log_id=direct_send_log_id,
+        )
+
+
+def _mark_application_send_failed(
+    send_log_id: str | None,
+    job_id: str,
+    exc: Exception,
+    *,
+    terminal: bool,
+) -> None:
+    """Persist a regular application-send failure outside the failed transaction."""
+    if not send_log_id:
+        return
+
+    async def _run():
+        from services.api.core.database import get_worker_session_factory
+        from services.api.models.db import Job, SendLog
+
+        session_factory = get_worker_session_factory()
+        async with session_factory() as session:
+            send_log = await session.get(SendLog, send_log_id)
+            if send_log and send_log.status not in {"sent", "delivered", "opened", "clicked"}:
+                send_log.status = "failed" if terminal else "queued"
+                send_log.error_message = str(exc)[:1000]
+                send_log.retry_count = (send_log.retry_count or 0) + 1
+            job = await session.get(Job, job_id)
+            if job and job.status == "sending":
+                job.status = "cover_generated"
+            await session.commit()
+
+    try:
+        _run_async(_run())
+    except Exception as mark_exc:
+        log_exception(
+            logger,
+            "application_send_failed_status_update_failed",
+            mark_exc,
+            send_log_id=send_log_id,
+            job_id=job_id,
         )
 
 
@@ -106,11 +146,19 @@ def send_direct_hr_email_task(
             direct_log.error_message = None
             await session.flush()
 
+            settings = get_settings()
             candidate_id = str(direct_log.candidate_id)
-            normalized_email = direct_log.hr_email.strip().lower()
+            normalized_email = (
+                settings.email_test_override or direct_log.hr_email
+            ).strip().lower()
             candidate = await session.get(Candidate, candidate_id)
             if not candidate:
                 raise ValueError(f"Candidate {candidate_id} not found")
+            if candidate.tenant_id != direct_log.tenant_id:
+                raise ValueError(
+                    f"Candidate {candidate_id} does not belong to direct-send tenant "
+                    f"{direct_log.tenant_id}"
+                )
             if not candidate.static_cover_letter:
                 raise ValueError(f"Candidate {candidate_id} has no static cover letter")
             if not normalized_email:
@@ -166,10 +214,10 @@ def send_direct_hr_email_task(
                 from_name=candidate.name,
                 attachment_bytes=resume_bytes,
                 attachment_filename=f"{candidate.name.replace(' ', '_')}_resume.pdf",
+                idempotency_key=direct_send_log_id,
             )
 
             message_id = await get_email_adapter().send(payload)
-            settings = get_settings()
             direct_log.status = "sent"
             direct_log.provider = settings.email_provider
             direct_log.provider_message_id = message_id
@@ -221,6 +269,7 @@ def send_application_email_task(
     cover_letter_override: Optional[str] = None,
     attach_resume: bool = True,
     dry_run: bool = False,
+    send_log_id: Optional[str] = None,
 ) -> dict:
     """Full email send pipeline:
     load → verify → dedup-check → render → fetch PDF → send → update DB.
@@ -254,18 +303,67 @@ def send_application_email_task(
                 raise ValueError(f"Job {job_id} not found")
             if not candidate:
                 raise ValueError(f"Candidate {candidate_id} not found")
+            if job.tenant_id != candidate.tenant_id:
+                raise ValueError(
+                    f"Job {job_id} and candidate {candidate_id} belong to different tenants"
+                )
+
+            reserved_send_log = None
+            if send_log_id:
+                reserved_send_log = await session.get(SendLog, send_log_id)
+                if not reserved_send_log:
+                    raise ValueError(f"Send log reservation {send_log_id} not found")
+                if (
+                    reserved_send_log.job_id != job_id
+                    or reserved_send_log.candidate_id != candidate_id
+                    or reserved_send_log.tenant_id != job.tenant_id
+                ):
+                    raise ValueError(
+                        f"Send log reservation {send_log_id} does not match job/candidate/tenant"
+                    )
+                if reserved_send_log.status in {"sent", "delivered", "opened", "clicked"}:
+                    logger.info(
+                        "send_task_skipped_completed_reservation",
+                        job_id=job_id,
+                        send_log_id=send_log_id,
+                        status=reserved_send_log.status,
+                    )
+                    return {"status": "skipped", "reason": "reservation already completed"}
+
+            async def _skip_reserved(reason: str) -> dict:
+                if reserved_send_log:
+                    reserved_send_log.status = "failed"
+                    reserved_send_log.error_message = f"Skipped: {reason}"[:1000]
+                    if job.status == "sending":
+                        job.status = "cover_generated"
+                    await session.commit()
+                return {"status": "skipped", "reason": reason}
+
+            # A durable reservation freezes the intended recipient. Without one,
+            # use the configured test redirect, explicit override, or job email.
+            to_email = (
+                reserved_send_log.to_email
+                if reserved_send_log
+                else (settings.email_test_override or override_email or job.hr_email)
+            )
 
             # ── Deduplication guard ───────────────────────────────────────────
             # Never send if there is already an active/in-flight SendLog for this
             # (job, candidate) pair. This prevents duplicate sends from concurrent
             # workers, rapid retry storms, and accidental double-clicks.
             # dry_run is exempt — it doesn't create a real Brevo send.
-            if not dry_run and not override_email:
+            if not dry_run:
+                duplicate_conditions = [
+                    SendLog.job_id == job_id,
+                    SendLog.candidate_id == candidate_id,
+                    SendLog.to_email == to_email,
+                    SendLog.status.in_(_ACTIVE_SEND_STATUSES),
+                ]
+                if send_log_id:
+                    duplicate_conditions.append(SendLog.id != send_log_id)
                 existing = await session.execute(
                     select(SendLog.id, SendLog.status).where(
-                        SendLog.job_id == job_id,
-                        SendLog.candidate_id == candidate_id,
-                        SendLog.status.in_(_ACTIVE_SEND_STATUSES),
+                        *duplicate_conditions,
                     ).limit(1).with_for_update(skip_locked=True)
                 )
                 row = existing.first()
@@ -277,24 +375,21 @@ def send_application_email_task(
                         existing_log_id=row[0],
                         existing_status=row[1],
                     )
-                    return {"status": "skipped", "reason": f"duplicate — active send_log exists ({row[1]})"}
+                    return await _skip_reserved(
+                        f"duplicate — active send_log exists ({row[1]})"
+                    )
 
             # Refuse to send to blacklisted companies (defense-in-depth —
             # the scraper already filters at save time, but jobs added before
             # blacklisting or via manual entry are caught here).
-            blacklist = await get_blacklisted_names(session)
+            blacklist = await get_blacklisted_names(session, str(job.tenant_id))
             if is_company_blacklisted(job.company or "", blacklist):
                 logger.info(
                     "send_skipped_blacklisted",
                     job_id=job_id,
                     company=job.company,
                 )
-                return {"status": "skipped", "reason": "company blacklisted"}
-
-            # Use the actual HR email (or override_email if provided).
-            # Set EMAIL_TEST_OVERRIDE in .env to redirect all sends to a test
-            # inbox without changing any other logic.
-            to_email = override_email or job.hr_email
+                return await _skip_reserved("company blacklisted")
 
             # Treat placeholder/junk emails the same as missing — they are not
             # real HR contacts and must not receive applications.
@@ -308,7 +403,9 @@ def send_application_email_task(
                 # Clear the placeholder so fix_placeholder_emails_task can retry discovery
                 job.hr_email = None
                 await session.commit()
-                return {"status": "skipped", "reason": "placeholder email — real HR email not yet discovered"}
+                return await _skip_reserved(
+                    "placeholder email — real HR email not yet discovered"
+                )
 
             # Don't re-apply to an address the registry already knows is dead
             # (hard-bounced / blocked / spam-flagged / fake). Clearing hr_email
@@ -328,7 +425,9 @@ def send_application_email_task(
                     )
                     job.hr_email = None
                     await session.commit()
-                    return {"status": "skipped", "reason": f"hr_email registry status={status_row[0]}"}
+                    return await _skip_reserved(
+                        f"hr_email registry status={status_row[0]}"
+                    )
 
             # If no HR email found yet, run inline discovery before giving up.
             if not to_email and not settings.email_test_override:
@@ -379,8 +478,6 @@ def send_application_email_task(
                         error=str(exc),
                     )
 
-            if settings.email_test_override:
-                to_email = settings.email_test_override
             if not to_email:
                 raise ValueError(
                     f"No destination email for job {job_id} — HR email missing "
@@ -389,9 +486,12 @@ def send_application_email_task(
 
             subject = override_subject or f"Application for {job.job_title} at {job.company}"
 
-            cover_letter_override = (cover_letter_override or "").strip() or None
+            # Do not assign back to the outer function argument here. Doing so
+            # makes it a local variable in this nested coroutine and causes an
+            # UnboundLocalError when Python evaluates the right-hand side.
+            normalized_cover_override = (cover_letter_override or "").strip() or None
 
-            if not cover_letter_override and job.cover_letter and str(job.candidate_id or "") != candidate_id:
+            if not normalized_cover_override and job.cover_letter and str(job.candidate_id or "") != candidate_id:
                 raise ValueError(
                     f"Cover letter for job {job_id} belongs to candidate "
                     f"{job.candidate_id}; selected candidate is {candidate_id}. "
@@ -400,18 +500,31 @@ def send_application_email_task(
 
             # MNC jobs always use static_cover_letter regardless of PHP/Python flag.
             # Non-PHP jobs also use static_cover_letter — no PHP/Laravel mentions.
-            if cover_letter_override:
-                cover_letter = cover_letter_override
+            if normalized_cover_override:
+                cover_letter = normalized_cover_override
+                cover_letter_source = "request_override"
             elif (job.source_portal == "mnc_direct" or not job.is_php_python) and candidate.static_cover_letter:
                 cover_letter = candidate.static_cover_letter
+                cover_letter_source = "candidate_static"
             elif job.cover_letter:
                 cover_letter = job.cover_letter
+                cover_letter_source = "job_generated"
             elif not job.is_php_python:
                 # Non-PHP but no static_cover_letter — generate using non-PHP template
                 from services.ai.tasks import _fill_cover_letter
                 cover_letter = await _fill_cover_letter(job, candidate)
+                cover_letter_source = "generated_inline"
             else:
                 raise ValueError(f"No cover letter for job {job_id}. Generate it first.")
+
+            logger.info(
+                "send_cover_letter_selected",
+                job_id=job_id,
+                candidate_id=candidate_id,
+                source=cover_letter_source,
+                source_portal=job.source_portal,
+                is_php_python=job.is_php_python,
+            )
 
             html_body = render_html(cover_letter, candidate, job)
             plain_body = render_plain(cover_letter, candidate, job)
@@ -424,6 +537,7 @@ def send_application_email_task(
                 except Exception as exc:
                     log_exception(logger, "resume_fetch_failed", exc)
 
+            log_id = send_log_id or str(uuid.uuid4())
             payload = EmailPayload(
                 to_email=to_email,
                 to_name="Hiring Manager",
@@ -434,22 +548,24 @@ def send_application_email_task(
                 from_name=candidate.name,
                 attachment_bytes=resume_bytes,
                 attachment_filename=f"{candidate.name.replace(' ', '_')}_resume.pdf",
+                idempotency_key=send_log_id or log_id,
             )
 
-            # Create send log entry
-            log_id = str(uuid.uuid4())
-            send_log = SendLog(
+            # Reuse the API's durable pre-queue reservation when present.
+            # Scheduled/internal tasks still create their own reservation here.
+            send_log = reserved_send_log or SendLog(
                 id=log_id,
+                tenant_id=job.tenant_id,
                 job_id=job_id,
                 candidate_id=candidate_id,
                 to_email=to_email,
-                subject=subject,
-                body_snippet=plain_body[:500],
-                status="queued",
-                provider=settings.email_provider,
             )
-            session.add(send_log)
-            await session.flush()
+            if reserved_send_log is None:
+                session.add(send_log)
+            send_log.to_email = to_email
+            send_log.subject = subject
+            send_log.body_snippet = plain_body[:500]
+            send_log.provider = settings.email_provider
 
             if dry_run:
                 send_log.status = "dry_run"
@@ -462,6 +578,12 @@ def send_application_email_task(
                     "subject": subject,
                     "html_preview": html_body[:500],
                 }
+
+            # Persist the in-flight state before the provider call. Brevo uses
+            # log_id as an idempotency key, so a retry cannot duplicate delivery.
+            send_log.status = "sending"
+            send_log.error_message = None
+            await session.commit()
 
             # Send via email adapter
             adapter = get_email_adapter()
@@ -486,16 +608,20 @@ def send_application_email_task(
     try:
         return _run_async(_run())
     except ValueError as exc:
+        _mark_application_send_failed(send_log_id, job_id, exc, terminal=True)
         log_exception(logger, "send_task_validation_failed", exc, job_id=job_id)
         raise
     except RuntimeError as exc:
         if "Brevo error 400" in str(exc) or "Brevo error 422" in str(exc):
+            _mark_application_send_failed(send_log_id, job_id, exc, terminal=True)
             log_exception(logger, "send_task_failed_permanent", exc, job_id=job_id)
             raise ValueError(str(exc))
-        log_exception(logger, "send_task_failed", exc, job_id=job_id)
+        _mark_application_send_failed(send_log_id, job_id, exc, terminal=False)
+        log_exception(logger, "send_task_failed", exc, job_id=job_id, send_log_id=send_log_id)
         raise self.retry(exc=exc)
     except Exception as exc:
-        log_exception(logger, "send_task_failed", exc, job_id=job_id)
+        _mark_application_send_failed(send_log_id, job_id, exc, terminal=False)
+        log_exception(logger, "send_task_failed", exc, job_id=job_id, send_log_id=send_log_id)
         raise self.retry(exc=exc)
 
 

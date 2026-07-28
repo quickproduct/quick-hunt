@@ -51,6 +51,7 @@ async def test_brevo_send_with_attachment():
         subject="Application",
         html_body="<p>Hi</p>",
         plain_body="Hi",
+        idempotency_key="4ef1bff5-4dd1-49c4-9a79-f190acd12abc",
         attachment_bytes=attachment_bytes,
         attachment_filename="resume.pdf",
     )
@@ -79,6 +80,7 @@ async def test_brevo_send_with_attachment():
         await adapter.send(payload)
 
     assert "attachment" in captured_body
+    assert captured_body["headers"]["Idempotency-Key"] == payload.idempotency_key
     assert len(captured_body["attachment"]) == 1
     att = captured_body["attachment"][0]
     assert att["name"] == "resume.pdf"
@@ -166,8 +168,8 @@ def test_render_email_html_is_valid_structure():
 # ------------------------------------------------------------------ #
 
 @pytest.mark.asyncio
-async def test_local_vector_upsert_and_query():
-    store = LocalVectorAdapter(path="/tmp/test_vectors_query.json")
+async def test_local_vector_upsert_and_query(tmp_path):
+    store = LocalVectorAdapter(path=str(tmp_path / "vectors-query.json"))
     store._store = {}
 
     v1 = [1.0, 0.0, 0.0]
@@ -181,8 +183,8 @@ async def test_local_vector_upsert_and_query():
 
 
 @pytest.mark.asyncio
-async def test_local_vector_delete():
-    store = LocalVectorAdapter(path="/tmp/test_vectors_delete.json")
+async def test_local_vector_delete(tmp_path):
+    store = LocalVectorAdapter(path=str(tmp_path / "vectors-delete.json"))
     store._store = {}
 
     await store.upsert("del1", [1.0, 0.0], {"job_id": "j1"})

@@ -108,9 +108,6 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
   log "Step 5 — Build Docker images (from repo root: $REPO_ROOT)"
   cd "$REPO_ROOT"
 
-  # Extract admin API key for dashboard build arg
-  ADMIN_KEY=$(grep '^NEXT_PUBLIC_ADMIN_API_KEY=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' | tr -d "'" || echo "local-dev-key")
-
   info "Building jh-api:local..."
   docker build -f infra/Dockerfile.api \
     -t "localhost:$REGISTRY_PORT/jh-api:local" \
@@ -128,7 +125,6 @@ if [[ "$SKIP_BUILD" == "false" ]]; then
 
   info "Building jh-dashboard:local..."
   docker build -f infra/Dockerfile.dashboard \
-    --build-arg "NEXT_PUBLIC_ADMIN_API_KEY=${ADMIN_KEY}" \
     -t "localhost:$REGISTRY_PORT/jh-dashboard:local" \
     . --quiet && ok "jh-dashboard built"
 
