@@ -76,8 +76,10 @@ cleanup_stale_terminating_api_pods() {
       $K delete pod "$pod" --grace-period=0 --force --wait=false
     fi
   done < <(
+    # Go templates emit every matching pod reliably across kubectl versions;
+    # the loop above ignores pods that do not have a deletion timestamp.
     $K get pods -l app=api \
-      -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}'
+      -o go-template='{{range .items}}{{.metadata.name}}{{"\t"}}{{.metadata.deletionTimestamp}}{{"\n"}}{{end}}'
   )
 }
 
@@ -244,6 +246,9 @@ deploy_cluster() {
   fi
 
   log "Waiting for core app rollouts..."
+  # A pod can enter deletion after the manifests are applied, so perform the
+  # guarded age check again at the exact point where it could block rollout.
+  cleanup_stale_terminating_api_pods
   $K rollout status deployment/api --timeout=180s
   $K rollout status deployment/dashboard --timeout=180s
   $K rollout status deployment/beat --timeout=180s
