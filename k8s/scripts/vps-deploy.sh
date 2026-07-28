@@ -11,6 +11,7 @@
 # Optional env:
 #   SKIP_INFRA=true bash k8s/scripts/vps-deploy.sh
 #   SKIP_MIGRATIONS=true bash k8s/scripts/vps-deploy.sh
+#   FORCE_RESTART=true bash k8s/scripts/vps-deploy.sh  # same SHA, env-only change
 
 set -euo pipefail
 
@@ -22,6 +23,7 @@ IMAGE_PREFIX="${IMAGE_PREFIX:-job-hunter}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "$REPO_ROOT" rev-parse --short HEAD)}"
 SKIP_INFRA="${SKIP_INFRA:-false}"
 SKIP_MIGRATIONS="${SKIP_MIGRATIONS:-false}"
+FORCE_RESTART="${FORCE_RESTART:-false}"
 
 K="kubectl -n $NS"
 
@@ -202,10 +204,16 @@ deploy_cluster() {
     apply_manifest "$file"
   done
 
-  # Re-run pods even when manifests have the same image tag. This matters when
-  # infra/.env changed and Kubernetes Secrets were refreshed in-place.
-  log "Restarting deployments so pods pick up refreshed images and secrets..."
-  $K rollout restart deployment
+  # Applying a fresh git-SHA image already starts one rollout for each app and
+  # worker. Starting a second rollout here can leave two generations pending
+  # termination and exhaust single-node capacity. Keep an explicit escape hatch
+  # for a same-SHA deployment whose only change is a refreshed environment.
+  if [[ "$FORCE_RESTART" == "true" ]]; then
+    log "Force-restarting deployments for a same-SHA environment-only change..."
+    $K rollout restart deployment
+  else
+    log "Fresh SHA manifests applied; skipping redundant second rollout."
+  fi
 
   if [[ -f "$K8S_DIR/ingress/ingress.yaml" ]]; then
     if grep -q "CHANGE_ME" "$K8S_DIR/ingress/ingress.yaml"; then
