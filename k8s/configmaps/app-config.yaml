@@ -7,7 +7,9 @@ data:
   # --- Environment ---
   ENVIRONMENT: "production"
   LOG_LEVEL: "WARNING"
-  LOG_TO_FILE: "true"
+  # Celery images run as a non-root user and Kubernetes already captures stdout.
+  # Shared hostPath rotation is neither writable nor process-safe for workers.
+  LOG_TO_FILE: "false"
   OTEL_SDK_DISABLED: "true"
   # Cap glibc malloc arenas. Default is 8 × CPU cores, which fragments heap memory
   # in multi-threaded Python workers (esp. the lxml/bs4 parsing in scraping +
