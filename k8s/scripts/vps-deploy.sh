@@ -561,7 +561,7 @@ with urllib.request.urlopen(request, timeout=15) as response:
 assert payload.get("access_token"), "login response did not contain an access token"
 assert payload.get("refresh_token"), "login response did not contain a refresh token"
 
-headers = {"Authorization": f"Bearer {payload['access_token']}"}
+headers = {"Authorization": "Bearer " + payload["access_token"]}
 
 def get_json(path):
     request = urllib.request.Request(
