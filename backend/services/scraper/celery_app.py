@@ -70,9 +70,8 @@ def _setup_worker_logging() -> None:
     )
 
 # Celery installs its own root handlers after importing the app. Connecting to
-# setup_logging makes our structured console + rotating file handlers the
-# authoritative configuration; without this hook, autoscaled worker logs only
-# existed on pod stdout and disappeared when KEDA scaled the pod back to zero.
+# setup_logging keeps our structured console output authoritative, including
+# task IDs, worker identity, and exception context in Kubernetes pod logs.
 @setup_logging.connect
 def _configure_celery_logging(**kwargs):
     _setup_worker_logging()
