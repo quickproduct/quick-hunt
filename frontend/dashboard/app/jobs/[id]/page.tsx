@@ -102,7 +102,11 @@ export default function JobDetailPage() {
       .then(([j, c]) => {
         setJob(j);
         setCandidates(c);
-        if (c.length > 0) setSelectedCandidate(c[0].id);
+        const assignedCandidate = j.candidate_id
+          ? c.find(candidate => candidate.id === j.candidate_id)
+          : undefined;
+        if (assignedCandidate) setSelectedCandidate(assignedCandidate.id);
+        else if (c.length > 0) setSelectedCandidate(c[0].id);
         setLoading(false);
       })
       .catch(() => {

@@ -48,7 +48,7 @@ os.environ["CELERY_BROKER_URL"] = _broker_url
 
 from celery import Celery  # noqa: E402 — must come after env override
 from celery.schedules import crontab  # noqa: E402
-from celery.signals import beat_init, worker_init, worker_process_init  # noqa: E402
+from celery.signals import beat_init, setup_logging, worker_init, worker_process_init  # noqa: E402
 
 celery_app = Celery("job_hunter")
 
@@ -68,6 +68,14 @@ def _setup_worker_logging() -> None:
         environment=settings.environment,
         service_name=os.environ.get("SERVICE_NAME", "scraper"),
     )
+
+# Celery installs its own root handlers after importing the app. Connecting to
+# setup_logging makes our structured console + rotating file handlers the
+# authoritative configuration; without this hook, autoscaled worker logs only
+# existed on pod stdout and disappeared when KEDA scaled the pod back to zero.
+@setup_logging.connect
+def _configure_celery_logging(**kwargs):
+    _setup_worker_logging()
 
 @worker_process_init.connect
 def _init_worker_process_logging(**kwargs):

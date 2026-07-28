@@ -13,7 +13,7 @@ const STATUS_OPTIONS = [
   // Brevo retrying (temporary)
   'soft_bounced', 'deferred',
   // Permanent failures
-  'bounced', 'blocked', 'spam', 'unsubscribed',
+  'failed', 'bounced', 'blocked', 'spam', 'unsubscribed',
   // Housekeeping
   'queued', 'dry_run',
 ];
