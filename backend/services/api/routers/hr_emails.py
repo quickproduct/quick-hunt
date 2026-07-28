@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.database import get_db
-from services.api.core.dependencies import get_current_user
+from services.api.core.dependencies import get_current_data_user
 from services.api.models.db import HrEmail, Job, SendLog, User
 from services.api.schemas.schemas import (
     BrevoImportResult,
@@ -26,7 +26,7 @@ from services.api.schemas.schemas import (
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/hr-emails", tags=["hr-emails"])
-Auth = Annotated[User, Depends(get_current_user)]
+Auth = Annotated[User, Depends(get_current_data_user)]
 
 _VALID_STATUSES = {"unknown", "valid", "invalid", "bounced", "fake"}
 

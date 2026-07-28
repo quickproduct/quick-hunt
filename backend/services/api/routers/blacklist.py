@@ -7,7 +7,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.database import get_db
-from services.api.core.dependencies import get_current_user
+from services.api.core.dependencies import get_current_data_user
 from services.api.models.db import BlacklistedCompany, User
 from services.api.schemas.schemas import (
     BlacklistedCompanyCreate,
@@ -16,7 +16,7 @@ from services.api.schemas.schemas import (
 )
 
 router = APIRouter(prefix="/blacklist", tags=["blacklist"])
-Auth = Annotated[User, Depends(get_current_user)]
+Auth = Annotated[User, Depends(get_current_data_user)]
 
 # Sentinel tenant holds globally seeded entries visible to all tenants
 SENTINEL_TENANT_ID = "00000000-0000-0000-0000-000000000001"

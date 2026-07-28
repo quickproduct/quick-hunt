@@ -560,7 +560,30 @@ with urllib.request.urlopen(request, timeout=15) as response:
     payload = json.load(response)
 assert payload.get("access_token"), "login response did not contain an access token"
 assert payload.get("refresh_token"), "login response did not contain a refresh token"
-print("Admin login: ok")
+
+headers = {"Authorization": f"Bearer {payload['access_token']}"}
+
+def get_json(path):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:8000{path}",
+        headers=headers,
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+candidates = get_json("/candidates")
+jobs = get_json("/jobs/count")
+stats = get_json("/stats")
+candidate_count = len(candidates)
+job_count = int(jobs.get("count", 0))
+dashboard_job_count = int(stats.get("total_jobs", 0))
+assert candidate_count > 0, "admin cannot see any operational candidates"
+assert job_count > 0, "admin cannot see any operational jobs"
+assert dashboard_job_count > 0, "admin dashboard reports zero operational jobs"
+print(
+    "Admin data access: ok "
+    f"candidates={candidate_count} jobs={job_count} dashboard_jobs={dashboard_job_count}"
+)
 '
 }
 

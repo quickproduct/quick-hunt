@@ -10,14 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.cache import cache_delete, cache_get, cache_set
 from services.api.core.database import get_db
-from services.api.core.dependencies import get_current_user
+from services.api.core.dependencies import get_current_data_user
 from services.api.models.db import Candidate, User
 from services.api.schemas.schemas import CandidateCreate, CandidateOut, CandidateUpdate
 
 _CANDIDATES_TTL = 300  # 5 minutes — candidates rarely change
 
 router = APIRouter(prefix="/candidates", tags=["candidates"])
-Auth = Annotated[User, Depends(get_current_user)]
+Auth = Annotated[User, Depends(get_current_data_user)]
 
 
 @router.post("", response_model=CandidateOut, status_code=status.HTTP_201_CREATED)
