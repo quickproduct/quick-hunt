@@ -541,6 +541,29 @@ SQL
     die "Database contains tenant-orphaned records."
 }
 
+verify_admin_login() {
+  log "Verifying seeded administrator login through the deployed API..."
+  $K exec deployment/api -- python -c '
+import json
+import os
+import urllib.request
+
+password = os.environ.get("INITIAL_ADMIN_PASSWORD", "")
+assert len(password) >= 16, "INITIAL_ADMIN_PASSWORD is unavailable in the API container"
+request = urllib.request.Request(
+    "http://127.0.0.1:8000/auth/login",
+    data=json.dumps({"email": "admin@gmail.com", "password": password}).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=15) as response:
+    payload = json.load(response)
+assert payload.get("access_token"), "login response did not contain an access token"
+assert payload.get("refresh_token"), "login response did not contain a refresh token"
+print("Admin login: ok")
+'
+}
+
 main() {
   cd "$REPO_ROOT"
   require_tools
@@ -552,6 +575,7 @@ main() {
   deploy_cluster
   verify_cluster
   verify_database
+  verify_admin_login
 
   log "Deployment complete."
   kubectl get nodes -o wide

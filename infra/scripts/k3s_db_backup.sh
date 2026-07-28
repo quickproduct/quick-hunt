@@ -32,6 +32,7 @@ command -v kubectl >/dev/null 2>&1 || die "kubectl is not installed or not on PA
 command -v gzip >/dev/null 2>&1 || die "gzip is not installed or not on PATH"
 
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
 
 log "Checking pod $NAMESPACE/$POD..."
 kubectl get pod "$POD" --namespace "$NAMESPACE" >/dev/null
@@ -49,6 +50,19 @@ if [[ ! -s "$BACKUP_FILE" ]]; then
   rm -f "$BACKUP_FILE"
   die "Backup failed: dump file was empty"
 fi
+
+log "Validating compressed PostgreSQL dump..."
+if ! gzip -t "$BACKUP_FILE"; then
+  rm -f "$BACKUP_FILE"
+  die "Backup failed: gzip integrity check failed"
+fi
+
+backup_header="$(gzip -cd "$BACKUP_FILE" | sed -n '1,5p')"
+if ! grep -Fqx -- "-- PostgreSQL database cluster dump" <<< "$backup_header"; then
+  rm -f "$BACKUP_FILE"
+  die "Backup failed: unexpected dump header"
+fi
+chmod 600 "$BACKUP_FILE"
 
 ln -sfn "$BACKUP_FILE" "$LATEST_LINK"
 
