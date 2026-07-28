@@ -61,6 +61,35 @@ validate_env() {
   fi
 }
 
+normalize_optional_integrations() {
+  local key configured=0 backup_path
+  local -a razorpay_keys=(
+    RAZORPAY_KEY_ID
+    RAZORPAY_KEY_SECRET
+    RAZORPAY_WEBHOOK_SECRET
+  )
+
+  for key in "${razorpay_keys[@]}"; do
+    [[ -n "$(env_value "$key")" ]] && configured=$((configured + 1))
+  done
+
+  if [[ "$configured" -gt 0 && "$configured" -lt "${#razorpay_keys[@]}" ]]; then
+    backup_path="${ENV_FILE}.pre-razorpay-disable.$(date -u '+%Y%m%dT%H%M%SZ')"
+    cp --preserve=mode,timestamps "$ENV_FILE" "$backup_path"
+    chmod 600 "$backup_path"
+    log "Incomplete Razorpay configuration detected; preserved $ENV_FILE at $backup_path and disabled billing keys."
+
+    for key in "${razorpay_keys[@]}"; do
+      if grep -q "^${key}=" "$ENV_FILE"; then
+        sed -i "s|^${key}=.*|${key}=|" "$ENV_FILE"
+      else
+        printf '%s=\n' "$key" >> "$ENV_FILE"
+      fi
+    done
+    chmod 600 "$ENV_FILE"
+  fi
+}
+
 cleanup_stale_terminating_api_pods() {
   kubectl get namespace "$NS" >/dev/null 2>&1 || return 0
 
@@ -396,6 +425,7 @@ main() {
   cd "$REPO_ROOT"
   require_tools
   validate_env
+  normalize_optional_integrations
   cleanup_stale_terminating_api_pods
   build_and_import_images
   deploy_cluster
