@@ -61,6 +61,26 @@ validate_env() {
   fi
 }
 
+cleanup_stale_terminating_api_pods() {
+  kubectl get namespace "$NS" >/dev/null 2>&1 || return 0
+
+  local now pod deleted_at deleted_epoch age_seconds
+  now="$(date +%s)"
+  while IFS=$'\t' read -r pod deleted_at; do
+    [[ -n "$pod" && -n "$deleted_at" ]] || continue
+    deleted_epoch="$(date -d "$deleted_at" +%s 2>/dev/null || echo 0)"
+    [[ "$deleted_epoch" -gt 0 ]] || continue
+    age_seconds=$((now - deleted_epoch))
+    if [[ "$age_seconds" -ge 300 ]]; then
+      log "Force-removing stale terminating API pod $pod (terminating for ${age_seconds}s)..."
+      $K delete pod "$pod" --grace-period=0 --force --wait=false
+    fi
+  done < <(
+    $K get pods -l app=api \
+      -o jsonpath='{range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{"\t"}{.metadata.deletionTimestamp}{"\n"}{end}'
+  )
+}
+
 create_secret_from_env() {
   log "Creating Kubernetes secrets from $ENV_FILE..."
 
@@ -271,6 +291,7 @@ main() {
   cd "$REPO_ROOT"
   require_tools
   validate_env
+  cleanup_stale_terminating_api_pods
   build_and_import_images
   deploy_cluster
   verify_cluster
