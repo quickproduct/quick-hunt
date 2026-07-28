@@ -231,11 +231,6 @@ class Settings(BaseSettings):
                     f"for: {', '.join(unchanged)}. Override them in infra/.env."
                 )
 
-            if self.frontend_url.startswith("http://localhost"):
-                raise ValueError(
-                    "ENVIRONMENT=production requires a non-local FRONTEND_URL."
-                )
-
             if self.email_provider == "brevo":
                 missing_brevo = [
                     name for name in (
@@ -260,6 +255,11 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Partial Razorpay configuration is unsafe; set key id, "
                     "key secret, and webhook secret together."
+                )
+            if all(razorpay_values) and self.frontend_url.startswith("http://localhost"):
+                raise ValueError(
+                    "Production Razorpay billing requires a non-local FRONTEND_URL "
+                    "for browser callbacks."
                 )
         return self
 
