@@ -34,11 +34,6 @@ spec:
                 configMapKeyRef:
                   name: job-hunter-config
                   key: FRONTEND_URL
-            - name: NEXT_PUBLIC_ADMIN_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: job-hunter-secrets
-                  key: NEXT_PUBLIC_ADMIN_API_KEY
           resources:
             requests:
               memory: "128Mi"

@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { formatDistanceToNow } from 'date-fns';
 import { ChevronDown, ChevronRight, RefreshCw, ExternalLink } from 'lucide-react';
 import StatusBadge, { STATUS_LABELS } from '../../components/StatusBadge';
@@ -25,7 +25,7 @@ export default function LogsPage() {
   const [statusFilter, setStatusFilter] = useState('');
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
 
-  const fetchLogs = async (showLoader = false) => {
+  const fetchLogs = useCallback(async (showLoader = false) => {
     if (showLoader) setLoading(true);
     try {
       const params: Record<string, unknown> = { limit: 100 };
@@ -38,16 +38,16 @@ export default function LogsPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [statusFilter]);
 
   useEffect(() => {
     fetchLogs(true);
-  }, [statusFilter]);
+  }, [fetchLogs]);
 
   useEffect(() => {
     const interval = setInterval(() => fetchLogs(false), 30000);
     return () => clearInterval(interval);
-  }, [statusFilter]);
+  }, [fetchLogs]);
 
   return (
     <div className="space-y-4">

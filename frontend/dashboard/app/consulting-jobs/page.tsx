@@ -19,7 +19,7 @@ import {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const STATUSES   = ['new', 'scoring', 'filtered', 'pending_approval', 'cover_generated', 'sending', 'sent', 'applied', 'bounced', 'ignored', 'error'];
+const STATUSES   = ['new', 'scoring', 'filtered', 'pending_approval', 'cover_generated', 'sending', 'sent', 'bounced', 'error'];
 const PAGE_SIZES = [5, 10, 20, 50, 100] as const;
 
 interface JobFilters {
@@ -45,13 +45,11 @@ function daysAgoISO(n: number): string { return new Date(Date.now() - n * 86_400
 function todayISO(): string { return new Date().toISOString().split('T')[0]; }
 
 const ROW_STATUS_BG: Record<string, string> = {
-  applied:          'bg-green-50/60 dark:bg-green-900/10',
   sent:             'bg-indigo-50/40 dark:bg-indigo-900/10',
   cover_generated:  'bg-blue-50/40 dark:bg-blue-900/10',
   pending_approval: 'bg-amber-50/40 dark:bg-amber-900/10',
   bounced:          'bg-red-50/40 dark:bg-red-900/10',
   error:            'bg-red-50/40 dark:bg-red-900/10',
-  ignored:          'opacity-50',
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -266,7 +264,7 @@ export default function ConsultingJobsPage() {
   // ── Bulk actions ─────────────────────────────────────────────────────────
   const handleBulkIgnore = async () => {
     const ids = await getEffectiveIds();
-    await Promise.all(ids.map(id => updateJobStatus(id, 'ignored')));
+    await Promise.all(ids.map(id => updateJobStatus(id, 'filtered')));
     toast.success(`Ignored ${ids.length} jobs`);
     clearSelection();
     fetchJobs();

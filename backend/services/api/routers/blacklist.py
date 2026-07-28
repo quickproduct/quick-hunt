@@ -76,7 +76,7 @@ async def update_blacklist_entry(
     db: AsyncSession = Depends(get_db),
 ):
     entry = await db.get(BlacklistedCompany, entry_id)
-    if not entry or entry.tenant_id not in (current_user.tenant_id, SENTINEL_TENANT_ID):
+    if not entry or entry.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not found")
     entry.reason = body.reason
     await db.flush()
@@ -91,6 +91,6 @@ async def remove_from_blacklist(
     db: AsyncSession = Depends(get_db),
 ):
     entry = await db.get(BlacklistedCompany, entry_id)
-    if not entry or entry.tenant_id not in (current_user.tenant_id, SENTINEL_TENANT_ID):
+    if not entry or entry.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not found")
     await db.delete(entry)

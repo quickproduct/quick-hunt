@@ -103,6 +103,8 @@ class Settings(BaseSettings):
     brevo_from_email: str = ""
     brevo_from_name: str = "Job Application Bot"
     brevo_webhook_secret: str = ""
+    # Resend is retained as a supported webhook source for older sends.
+    resend_webhook_secret: str = ""
     # SMTP fallback
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
@@ -227,6 +229,37 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"ENVIRONMENT=production but insecure default values are still set "
                     f"for: {', '.join(unchanged)}. Override them in infra/.env."
+                )
+
+            if self.frontend_url.startswith("http://localhost"):
+                raise ValueError(
+                    "ENVIRONMENT=production requires a non-local FRONTEND_URL."
+                )
+
+            if self.email_provider == "brevo":
+                missing_brevo = [
+                    name for name in (
+                        "brevo_api_key",
+                        "brevo_from_email",
+                        "brevo_webhook_secret",
+                    )
+                    if not getattr(self, name)
+                ]
+                if missing_brevo:
+                    raise ValueError(
+                        "Production Brevo email requires: "
+                        + ", ".join(missing_brevo)
+                    )
+
+            razorpay_values = (
+                self.razorpay_key_id,
+                self.razorpay_key_secret,
+                self.razorpay_webhook_secret,
+            )
+            if any(razorpay_values) and not all(razorpay_values):
+                raise ValueError(
+                    "Partial Razorpay configuration is unsafe; set key id, "
+                    "key secret, and webhook secret together."
                 )
         return self
 

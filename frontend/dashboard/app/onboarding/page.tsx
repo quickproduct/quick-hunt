@@ -216,7 +216,7 @@ export default function OnboardingPage() {
                   Welcome to QuickHunt!
                 </h1>
                 <p className="text-sm text-gray-500 dark:text-gray-400 max-w-md">
-                  Let's get your workspace configured for automated PHP/Laravel job applications.
+                  Let&apos;s get your workspace configured for automated PHP/Laravel job applications.
                 </p>
               </div>
 
@@ -306,10 +306,10 @@ export default function OnboardingPage() {
                       Require manual approval
                     </p>
                     <p className="text-xs text-gray-400 dark:text-gray-500">
-                      Recommended: Review applications before they're sent
+                      Recommended: Review applications before they&apos;re sent
                     </p>
                     <p className="text-xs text-gray-400 dark:text-gray-500">
-                      You'll be notified when a new cover letter is ready for review
+                      You&apos;ll be notified when a new cover letter is ready for review
                     </p>
                   </div>
                   <Toggle
@@ -409,10 +409,10 @@ export default function OnboardingPage() {
                 </div>
                 <div className="space-y-1">
                   <h2 className="text-2xl font-bold text-gray-900 dark:text-gray-100">
-                    You're all set!
+                    You&apos;re all set!
                   </h2>
                   <p className="text-sm text-gray-500 dark:text-gray-400 max-w-xs">
-                    Your workspace is configured. Here's what happens next:
+                    Your workspace is configured. Here&apos;s what happens next:
                   </p>
                 </div>
               </div>

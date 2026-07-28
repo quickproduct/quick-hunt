@@ -158,6 +158,112 @@ async def test_direct_send_queues_unique_hr_emails(async_client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_application_send_reserves_log_before_queue(async_client, db_session, monkeypatch):
+    """Normal sends must be auditable even before a worker receives the task."""
+    import uuid
+    from sqlalchemy import select
+    from services.api.models.db import Candidate, Job, SendLog, SENTINEL_TENANT_ID
+    from services.api.routers import send as send_router
+
+    candidate = Candidate(
+        id=str(uuid.uuid4()),
+        tenant_id=SENTINEL_TENANT_ID,
+        name="Queued Send Candidate",
+        email="candidate@example.com",
+    )
+    job = Job(
+        id=str(uuid.uuid4()),
+        tenant_id=SENTINEL_TENANT_ID,
+        candidate_id=candidate.id,
+        job_title="Python Engineer",
+        company="Queue Corp",
+        job_url=f"https://example.com/{uuid.uuid4().hex}",
+        source_portal="naukri",
+        dedupe_hash=uuid.uuid4().hex,
+        hr_email="hr@queue.example",
+        cover_letter="I am interested in this role.",
+    )
+    db_session.add_all([candidate, job])
+    await db_session.commit()
+
+    captured = {}
+
+    class FakeTask:
+        id = "application-task-1"
+
+    def fake_send_task(name, **kwargs):
+        captured.update({"name": name, **kwargs})
+        return FakeTask()
+
+    monkeypatch.setattr(send_router.celery_app, "send_task", fake_send_task)
+    response = await async_client.post(
+        f"/jobs/{job.id}/send",
+        json={"candidate_id": candidate.id},
+    )
+
+    assert response.status_code == 200
+    send_log_id = response.json()["send_log_id"]
+    send_log = await db_session.scalar(select(SendLog).where(SendLog.id == send_log_id))
+    assert send_log is not None
+    assert send_log.status == "queued"
+    assert captured["kwargs"]["send_log_id"] == send_log_id
+
+
+@pytest.mark.asyncio
+async def test_pending_application_approval_queues_send(async_client, db_session, monkeypatch):
+    import uuid
+    from services.api.models.db import Candidate, Job, SENTINEL_TENANT_ID
+    from services.api.routers import send as send_router
+
+    candidate = Candidate(
+        id=str(uuid.uuid4()),
+        tenant_id=SENTINEL_TENANT_ID,
+        name="Approval Candidate",
+        email="approval@example.com",
+    )
+    job = Job(
+        id=str(uuid.uuid4()),
+        tenant_id=SENTINEL_TENANT_ID,
+        candidate_id=candidate.id,
+        job_title="Backend Engineer",
+        company="Approval Corp",
+        job_url=f"https://example.com/{uuid.uuid4().hex}",
+        source_portal="naukri",
+        dedupe_hash=uuid.uuid4().hex,
+        hr_email="hr@approval.example",
+        cover_letter="Please consider my application.",
+        status="pending_approval",
+    )
+    db_session.add_all([candidate, job])
+    await db_session.commit()
+
+    class FakeTask:
+        id = "approval-task-1"
+
+    monkeypatch.setattr(send_router.celery_app, "send_task", lambda *args, **kwargs: FakeTask())
+    response = await async_client.post(f"/jobs/{job.id}/approve")
+
+    assert response.status_code == 200
+    await db_session.refresh(job)
+    assert job.status == "sending"
+    assert response.json()["send_log_id"]
+
+
+@pytest.mark.asyncio
+async def test_resend_webhook_requires_signature_when_configured(async_client, monkeypatch):
+    from types import SimpleNamespace
+    from services.api.routers import webhooks
+
+    monkeypatch.setattr(
+        webhooks,
+        "get_settings",
+        lambda: SimpleNamespace(resend_webhook_secret="whsec_dGVzdA=="),
+    )
+    response = await async_client.post("/webhooks/resend", json={"type": "email.sent"})
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_stats_returns_expected_shape(async_client):
     """GET /stats should return all required keys."""
     resp = await async_client.get("/stats")

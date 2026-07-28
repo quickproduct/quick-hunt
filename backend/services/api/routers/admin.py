@@ -1,6 +1,6 @@
 """Admin router — system health, worker control, feature flags, logs, queue monitoring.
 
-All endpoints require owner or admin role (AdminPlus dependency).
+All endpoints require platform-operator access (PlatformAdmin dependency).
 """
 from typing import Annotated, Any, AsyncGenerator, Literal, Optional
 import asyncio
@@ -15,7 +15,7 @@ from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.database import get_db
-from services.api.core.dependencies import AdminPlus
+from services.api.core.dependencies import PlatformAdmin
 from services.api.models.db import User
 from services.api.services.admin_service import (
     ALL_PORTALS,
@@ -53,7 +53,7 @@ from services.api.services.admin_service import (
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
-Auth = Annotated[User, Depends(AdminPlus)]
+Auth = Annotated[User, Depends(PlatformAdmin)]
 
 
 def _parse_naive_utc_iso(value: str):

@@ -16,7 +16,6 @@
     "declaration": false,
     "module": "esnext",
     "target": "esnext",
-    "baseUrl": ".",
     "paths": {
       "@/*": [
         "./src/*"

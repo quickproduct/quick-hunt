@@ -1,7 +1,7 @@
 playwright==1.50.0
 dnspython==2.6.1
 beautifulsoup4==4.12.3
-lxml==5.2.1
+lxml==6.1.0
 # selectolax (lexbor C engine) backs services/scraper/html.py — the fast,
 # low-RSS parser for the CSS-selector adapters. bs4+lxml kept for XML/RSS
 # feeds (weworkremotely) which selectolax cannot parse.

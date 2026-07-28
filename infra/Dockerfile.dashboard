@@ -8,8 +8,6 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV API_BASE_URL=http://api:8000
-ARG NEXT_PUBLIC_ADMIN_API_KEY=change-me
-ENV NEXT_PUBLIC_ADMIN_API_KEY=$NEXT_PUBLIC_ADMIN_API_KEY
 
 COPY --from=deps /app/node_modules ./node_modules
 COPY frontend/dashboard/package.json ./package.json

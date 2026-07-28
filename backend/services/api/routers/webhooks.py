@@ -63,8 +63,13 @@ async def resend_webhook(
     settings = get_settings()
     raw_body = await request.body()
 
-    # Verify signature if secret is configured
-    if settings.resend_webhook_secret and svix_signature:
+    # When a secret is configured, a missing signature is invalid too. The old
+    # conditional only verified signed requests and accidentally accepted an
+    # attacker who omitted the signature header entirely.
+    if settings.resend_webhook_secret:
+        if not (svix_id and svix_timestamp and svix_signature):
+            logger.warning("resend_webhook_missing_signature")
+            raise HTTPException(status_code=403, detail="Missing webhook signature")
         valid = _verify_resend_signature(
             raw_body,
             svix_id,

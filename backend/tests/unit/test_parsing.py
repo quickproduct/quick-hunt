@@ -158,6 +158,25 @@ def test_naukri_parse_item():
     assert job.job_title == "Senior Python Engineer"
     assert job.company == "TechCorp Solutions"
     assert job.location == "Bangalore"
+    assert job.salary_min == 1_200_000
+    assert job.salary_max == 1_800_000
+    assert job.salary_currency == "INR"
+    assert job.experience_required == "3-6 Yrs"
+
+
+def test_naukri_parse_item_live_v2_fields():
+    item = {
+        "post": "Backend Engineer",
+        "companyName": "Example Labs",
+        "city": "Pune",
+        "urlStr": "https://www.naukri.com/job/backend-engineer-67890",
+        "jobDesc": "Build reliable Python services.",
+    }
+    job = NaukriAdapter()._parse_item(item)
+    assert job is not None
+    assert job.job_title == "Backend Engineer"
+    assert job.location == "Pune"
+    assert job.job_url.endswith("67890")
 
 
 # ------------------------------------------------------------------ #

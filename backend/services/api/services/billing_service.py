@@ -76,7 +76,7 @@ async def create_checkout(
         )
 
     settings = get_settings()
-    if not settings.razorpay_key_id:
+    if not settings.razorpay_key_id or not settings.razorpay_key_secret:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Billing not configured.",
@@ -112,6 +112,19 @@ async def handle_webhook(session: AsyncSession, payload: bytes, signature: str) 
     """Verify Razorpay webhook signature and update tenant plan."""
     settings = get_settings()
 
+    if not settings.razorpay_webhook_secret:
+        logger.error("razorpay_webhook_rejected_not_configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing webhook is not configured.",
+        )
+    if not signature:
+        logger.warning("razorpay_webhook_missing_signature")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing webhook signature.",
+        )
+
     # Verify HMAC-SHA256 signature
     expected = hmac.new(
         settings.razorpay_webhook_secret.encode(),
@@ -131,8 +144,14 @@ async def handle_webhook(session: AsyncSession, payload: bytes, signature: str) 
         notes = event.get("payload", {}).get("payment_link", {}).get("entity", {}).get("notes", {})
         tenant_id = notes.get("tenant_id")
         plan = notes.get("plan")
-        if tenant_id and plan:
+        if tenant_id and plan in PLANS:
             await _activate_plan(session, tenant_id, plan, event)
+        elif tenant_id or plan:
+            logger.warning(
+                "razorpay_webhook_invalid_notes",
+                tenant_id=tenant_id,
+                plan=plan,
+            )
 
     return {"received": True}
 
@@ -159,6 +178,12 @@ async def verify_callback(
 ) -> dict:
     """Verify Razorpay payment-link callback signature and activate the plan."""
     settings = get_settings()
+
+    if not settings.razorpay_key_id or not settings.razorpay_key_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing not configured.",
+        )
 
     # Razorpay callback signature: HMAC-SHA256(key=key_secret,
     #   msg="{payment_link_id}|{reference_id}|{status}|{payment_id}")
@@ -229,17 +254,29 @@ async def _activate_plan(
     if not tenant:
         return
 
-    payment_id = event.get("payload", {}).get("payment", {}).get("entity", {}).get("id")
+    payload = event.get("payload", {})
+    payment_id = payload.get("payment", {}).get("entity", {}).get("id")
+    # payment_link.paid payloads do not always include a standalone payment
+    # entity. The payment-link id is stable and still provides webhook
+    # idempotency for the one-time plan activation.
+    provider_event_id = (
+        payment_id
+        or payload.get("payment_link", {}).get("entity", {}).get("id")
+    )
 
     # Idempotency: skip if subscription for this payment already exists
-    if payment_id:
+    if provider_event_id:
         existing = await session.execute(
             select(BillingSubscription).where(
-                BillingSubscription.provider_sub_id == payment_id
+                BillingSubscription.provider_sub_id == provider_event_id
             )
         )
         if existing.scalar_one_or_none():
-            logger.info("plan_already_activated", tenant_id=tenant_id, payment_id=payment_id)
+            logger.info(
+                "plan_already_activated",
+                tenant_id=tenant_id,
+                provider_event_id=provider_event_id,
+            )
             return
 
     tenant.plan = plan
@@ -249,7 +286,7 @@ async def _activate_plan(
         plan=plan,
         status="active",
         provider="razorpay",
-        provider_sub_id=payment_id,
+        provider_sub_id=provider_event_id,
         current_period_end=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=30),
     )
     session.add(sub)

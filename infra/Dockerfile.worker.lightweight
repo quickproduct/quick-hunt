@@ -7,7 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev && rm
 COPY backend/requirements-shared.txt ./backend/requirements-shared.txt
 COPY backend/services/scraper/requirements.txt ./backend/services/scraper/requirements.txt
 
-RUN pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir --upgrade pip "setuptools>=83.0.0" wheel && \
+    python -m pip install --no-cache-dir \
     -r backend/requirements-shared.txt \
     -r backend/services/scraper/requirements.txt
 

@@ -6,11 +6,16 @@ Create Date: 2026-05-13 00:00:00.000000
 
 Creates:
   - Tenant: "Admin" (slug: admin), plan: pro
-  - User: admin@gmail.com / admin@123, role: owner, pre-verified
+  - User: admin@gmail.com with a deployment-specific bootstrap password
   - Membership: owner on the admin tenant
 """
+import os
+import secrets
+
 from alembic import op
 from sqlalchemy import text
+
+from services.api.core.security import hash_password
 
 revision = "0028"
 down_revision = "0027"
@@ -22,12 +27,15 @@ ADMIN_USER_ID   = "00000000-0000-0000-0000-000000000020"
 ADMIN_MEMBER_ID = "00000000-0000-0000-0000-000000000030"
 
 ADMIN_EMAIL    = "admin@gmail.com"
-# bcrypt hash of "admin@123" (cost 12)
-ADMIN_HASH     = "$2b$12$jIRJMndIjoMoOzeMAGwV/eLWyDablUILUULSLjrkw43xSMNrUoLcS"
 
 
 def upgrade() -> None:
     conn = op.get_bind()
+    configured_password = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+    if configured_password and len(configured_password) < 16:
+        raise RuntimeError("INITIAL_ADMIN_PASSWORD must be at least 16 characters")
+    admin_password = configured_password or secrets.token_urlsafe(24)
+    admin_is_active = bool(configured_password)
 
     # ── 1. Tenant ─────────────────────────────────────────────────────────────
     conn.execute(
@@ -43,14 +51,15 @@ def upgrade() -> None:
     conn.execute(
         text("""
             INSERT INTO users (id, tenant_id, email, hashed_password, role, is_verified, is_active)
-            VALUES (:id, :tenant_id, :email, :hashed_password, 'owner', true, true)
+            VALUES (:id, :tenant_id, :email, :hashed_password, 'owner', true, :is_active)
             ON CONFLICT DO NOTHING
         """),
         {
             "id": ADMIN_USER_ID,
             "tenant_id": ADMIN_TENANT_ID,
             "email": ADMIN_EMAIL,
-            "hashed_password": ADMIN_HASH,
+            "hashed_password": hash_password(admin_password),
+            "is_active": admin_is_active,
         },
     )
 
@@ -70,7 +79,10 @@ def upgrade() -> None:
 
     print("\n✓ Admin user seeded")
     print(f"  Email:    {ADMIN_EMAIL}")
-    print(f"  Password: admin@123")
+    if configured_password:
+        print("  Credential: supplied through INITIAL_ADMIN_PASSWORD")
+    else:
+        print("  Account disabled: set INITIAL_ADMIN_PASSWORD before migration to enable it")
     print(f"  Role:     owner")
     print(f"  Tenant:   Admin (id={ADMIN_TENANT_ID})\n")
 

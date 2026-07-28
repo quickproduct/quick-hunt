@@ -208,7 +208,7 @@ export default function JobDetailScreen() {
             <View style={styles.readinessRow}>
               <ReadinessItem done={!!job.hr_email} label="HR email" />
               <ReadinessItem done={!!job.cover_letter} label="Cover letter" />
-              <ReadinessItem done={job.status !== 'ignored' && job.status !== 'error'} label="Active status" />
+              <ReadinessItem done={job.status !== 'filtered' && job.status !== 'error'} label="Active status" />
             </View>
           </GlassCard>
 

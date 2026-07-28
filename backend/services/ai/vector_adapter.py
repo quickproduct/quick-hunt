@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import tempfile
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -214,8 +215,11 @@ class PineconeAdapter(BaseVectorAdapter):
 class LocalVectorAdapter(BaseVectorAdapter):
     """JSON file-based vector store — for development/testing with no external dependencies."""
 
-    def __init__(self, path: str = "/tmp/jobhunter_vectors.json") -> None:
-        self._path = Path(path)
+    def __init__(self, path: str | None = None) -> None:
+        # Include the uid in the development fallback filename and never follow
+        # symlinks when reading it. This avoids a predictable shared-/tmp target.
+        default_path = Path(tempfile.gettempdir()) / f"jobhunter_vectors_{os.getuid()}.json"
+        self._path = Path(path) if path else default_path
         self._lock = threading.Lock()
         self._store: dict[str, dict] = {}
         self._load()
@@ -224,14 +228,41 @@ class LocalVectorAdapter(BaseVectorAdapter):
     def _load(self) -> None:
         if self._path.exists():
             try:
-                with open(self._path) as f:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(self._path, flags)
+                with os.fdopen(fd) as f:
                     self._store = json.load(f)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "local_vector_store_load_failed",
+                    path=str(self._path),
+                    error=str(exc),
+                )
                 self._store = {}
 
     def _save(self) -> None:
-        with open(self._path, "w") as f:
-            json.dump(self._store, f)
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{self._path.name}.",
+            dir=self._path.parent,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self._store, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, self._path)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
 
     async def upsert(self, id: str, vector: list[float], metadata: dict) -> None:
         with self._lock:

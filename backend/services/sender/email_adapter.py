@@ -39,6 +39,7 @@ class EmailPayload:
     attachment_bytes: Optional[bytes] = None
     attachment_filename: str = "resume.pdf"
     reply_to: str = ""
+    idempotency_key: str = ""
 
 
 class BaseEmailAdapter(ABC):
@@ -243,6 +244,9 @@ class BrevoAdapter(BaseEmailAdapter):
                     "name": payload.attachment_filename,
                 }
             ]
+
+        if payload.idempotency_key:
+            body["headers"] = {"Idempotency-Key": payload.idempotency_key}
 
         headers = {
             "api-key": self._api_key,

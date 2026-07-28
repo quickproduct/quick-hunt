@@ -14,13 +14,21 @@ from typing import Annotated, Optional
 
 from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError
+from jwt import InvalidTokenError as JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.core.config import get_settings
 from services.api.core.database import get_db
 from services.api.core.security import decode_token
 from services.api.models.db import SENTINEL_TENANT_ID, Tenant, User
+
+# Infrastructure/operator access is intentionally limited to the internal API
+# service account and the seeded platform-admin tenant. A customer tenant's
+# owner/admin role is tenant-local and must not grant cluster-wide controls.
+PLATFORM_ADMIN_TENANT_IDS = frozenset({
+    SENTINEL_TENANT_ID,
+    "00000000-0000-0000-0000-000000000002",
+})
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -116,6 +124,19 @@ def OwnerOnly(user: User = Depends(get_current_user)) -> User:
 def AdminPlus(user: User = Depends(get_current_user)) -> User:
     if user.role not in ("owner", "admin"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required.")
+    return user
+
+
+def PlatformAdmin(user: User = Depends(get_current_user)) -> User:
+    """Require a platform operator, not merely a tenant-local administrator."""
+    if (
+        user.role not in ("owner", "admin")
+        or user.tenant_id not in PLATFORM_ADMIN_TENANT_IDS
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Platform administrator access required.",
+        )
     return user
 
 

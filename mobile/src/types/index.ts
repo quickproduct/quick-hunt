@@ -38,9 +38,7 @@ export type JobStatus =
   | 'cover_generated'
   | 'sending'
   | 'sent'
-  | 'applied'
   | 'bounced'
-  | 'ignored'
   | 'error';
 
 export interface Job {
