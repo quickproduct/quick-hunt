@@ -392,10 +392,48 @@ deploy_cluster() {
   done < <($K get deployments -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 }
 
+summarize_runtime_failure_signatures() {
+  # Emit diagnostic labels only; never echo the full application log line.
+  # Event names and exception classes are code-defined identifiers, while
+  # messages may contain URLs, user data, or credentials.
+  awk '
+    /"level"[[:space:]]*:[[:space:]]*"critical"/ {
+      value = $0
+      sub(/^.*"event"[[:space:]]*:[[:space:]]*"/, "", value)
+      sub(/".*/, "", value)
+      gsub(/[^A-Za-z0-9_.-]/, "", value)
+      print "structured-critical:" (value == "" ? "unknown-event" : substr(value, 1, 80))
+      next
+    }
+    /^\[[^]]*:[[:space:]]*CRITICAL\// {
+      value = $0
+      sub(/^.*CRITICAL\/[^]]*\][[:space:]]*/, "", value)
+      sub(/:.*/, "", value)
+      gsub(/[^A-Za-z0-9_. -]/, "", value)
+      print "celery-critical:" (value == "" ? "unknown-event" : substr(value, 1, 80))
+      next
+    }
+    /^CRITICAL([[:space:]:]|$)|^\[[^]]+\][[:space:]]+CRITICAL([[:space:]:]|$)/ { print "text-critical"; next }
+    /^Traceback \(most recent call last\):/ { print "python-traceback"; next }
+    /(^|[[:space:]])(SyntaxError|ModuleNotFoundError|ImportError):/ {
+      value = $0
+      sub(/^.*(SyntaxError|ModuleNotFoundError|ImportError):.*/, "", value)
+      if ($0 ~ /SyntaxError:/) print "python-exception:SyntaxError"
+      else if ($0 ~ /ModuleNotFoundError:/) print "python-exception:ModuleNotFoundError"
+      else print "python-exception:ImportError"
+      next
+    }
+    /UnhandledPromiseRejection/ { print "node-unhandled-rejection"; next }
+    /(^|[[:space:]])panic:/ { print "go-panic"; next }
+    /(^|[[:space:]])FATAL([[:space:]:]|$)/ { print "fatal"; next }
+  ' | sort -u | paste -sd, -
+}
+
 verify_cluster() {
   log "Verifying deployed revision ${IMAGE_TAG}..."
 
   local unhealthy draining pod current_errors previous_errors restart_total
+  local current_matches previous_matches current_signatures previous_signatures
   local runtime_failure_pattern
   # Match emitted failure records, not documentation/configuration strings that
   # merely mention words such as "CRITICAL" or "ImportError".  Structlog emits
@@ -421,12 +459,17 @@ verify_cluster() {
   restart_total="$($K get pods -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}{end}' | awk '{sum += $1} END {print sum + 0}')"
   log "Current pod container restart total: $restart_total"
 
-  log "Scanning recent pod logs for high-signal runtime failures (counts only)..."
+  log "Scanning recent pod logs for high-signal runtime failures (counts and safe signatures only)..."
   while IFS= read -r pod; do
-    current_errors="$($K logs "$pod" --all-containers --since=15m --tail=1000 2>/dev/null | grep -Eic "$runtime_failure_pattern" || true)"
-    previous_errors="$($K logs "$pod" --all-containers --previous --tail=500 2>/dev/null | grep -Eic "$runtime_failure_pattern" || true)"
-    printf 'log-scan pod=%s current_high_signal=%s previous_high_signal=%s\n' \
-      "$pod" "${current_errors:-0}" "${previous_errors:-0}"
+    current_matches="$($K logs "$pod" --all-containers --since=15m --tail=1000 2>/dev/null | grep -Ei "$runtime_failure_pattern" || true)"
+    previous_matches="$($K logs "$pod" --all-containers --previous --tail=500 2>/dev/null | grep -Ei "$runtime_failure_pattern" || true)"
+    current_errors="$(printf '%s\n' "$current_matches" | awk 'NF { count++ } END { print count + 0 }')"
+    previous_errors="$(printf '%s\n' "$previous_matches" | awk 'NF { count++ } END { print count + 0 }')"
+    current_signatures="$(printf '%s\n' "$current_matches" | summarize_runtime_failure_signatures)"
+    previous_signatures="$(printf '%s\n' "$previous_matches" | summarize_runtime_failure_signatures)"
+    printf 'log-scan pod=%s current_high_signal=%s current_signatures=%s previous_high_signal=%s previous_signatures=%s\n' \
+      "$pod" "${current_errors:-0}" "${current_signatures:-none}" \
+      "${previous_errors:-0}" "${previous_signatures:-none}"
   done < <($K get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 }
 
