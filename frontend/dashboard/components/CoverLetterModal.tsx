@@ -31,12 +31,14 @@ export default function CoverLetterModal({ job, candidateId, onClose, onSent }: 
       if (dryRun) {
         toast.success('Dry run complete — email NOT sent');
       } else {
-        toast.success('Application sent!');
+        toast.success('Application queued for sending');
         onSent?.();
         onClose();
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to send';
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        (err instanceof Error ? err.message : 'Failed to send');
       toast.error(msg);
     } finally {
       setSending(false);

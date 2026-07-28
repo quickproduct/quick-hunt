@@ -208,6 +208,35 @@ async def test_send_rejects_other_tenant_job(db_session):
 
 
 @pytest.mark.asyncio
+async def test_send_rejects_placeholder_email_before_queue(db_session, monkeypatch):
+    candidate = _candidate("tenant-a")
+    job = _job("tenant-a", candidate.id)
+    job.hr_email = "info@brandbucket.com"
+    db_session.add_all([candidate, job])
+    await db_session.commit()
+
+    queued = []
+    monkeypatch.setattr(
+        "services.api.routers.send.celery_app.send_task",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await send_application(
+            job.id,
+            SendRequest(candidate_id=candidate.id),
+            _user("tenant-a"),
+            db_session,
+        )
+
+    assert exc.value.status_code == 422
+    assert "not a valid recruiter inbox" in exc.value.detail
+    assert queued == []
+    await db_session.refresh(job)
+    assert job.hr_email is None
+
+
+@pytest.mark.asyncio
 async def test_static_cover_fallback_stays_within_job_tenant(db_session, monkeypatch):
     candidate_a = _candidate("tenant-a")
     candidate_a.static_cover_letter = "Tenant A cover"

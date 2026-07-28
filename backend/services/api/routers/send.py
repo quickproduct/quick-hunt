@@ -20,6 +20,7 @@ from services.api.core.dependencies import get_current_data_user
 from services.api.models.db import Candidate, DirectSendLog, Job, SendLog, User
 from services.scraper.celery_app import celery_app
 from services.api.schemas.schemas import SendLogEnrichedOut, SendRequest
+from services.common.placeholder_emails import is_placeholder_email
 
 _SEND_LOGS_CACHE_TTL = 30  # seconds
 
@@ -47,6 +48,27 @@ async def send_application(
         raise HTTPException(
             status_code=422,
             detail="Job has no HR email. Run email discovery first or provide override_email.",
+        )
+
+    # Reject junk/role inboxes before publishing a task. Previously the API
+    # returned a successful queue response and the worker rejected the address
+    # later, which made a blocked send look like a delivered application.
+    if not body.dry_run and is_placeholder_email(str(to_email)):
+        if not body.override_email and job.hr_email == to_email:
+            job.hr_email = None
+            await db.commit()
+        logger.warning(
+            "application_send_rejected_placeholder_email",
+            job_id=job_id,
+            candidate_id=body.candidate_id,
+            to_email=str(to_email),
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{to_email} is not a valid recruiter inbox. "
+                "Run HR email discovery or provide a verified recruiter email."
+            ),
         )
 
     cover_letter = (body.cover_letter or "").strip() or None
@@ -176,6 +198,23 @@ async def approve_application(
         raise HTTPException(
             status_code=422,
             detail="Approval requires a candidate, HR email, and cover letter.",
+        )
+    if is_placeholder_email(job.hr_email):
+        rejected_email = job.hr_email
+        job.hr_email = None
+        await db.commit()
+        logger.warning(
+            "application_approval_rejected_placeholder_email",
+            job_id=job.id,
+            candidate_id=job.candidate_id,
+            to_email=rejected_email,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{rejected_email} is not a valid recruiter inbox. "
+                "Run HR email discovery or provide a verified recruiter email."
+            ),
         )
     candidate = await db.get(Candidate, job.candidate_id)
     if not candidate or candidate.tenant_id != current_user.tenant_id:
