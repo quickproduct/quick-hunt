@@ -1,4 +1,5 @@
 fastapi==0.139.2
 uvicorn[standard]==0.29.0
 python-multipart==0.0.31
+email-validator==2.3.0
 passlib[bcrypt]==1.7.4
