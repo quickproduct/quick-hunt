@@ -84,6 +84,21 @@ cleanup_stale_terminating_api_pods() {
   )
 }
 
+cleanup_superseded_api_pods() {
+  local target_image="${IMAGE_PREFIX}/jh-api:${IMAGE_TAG}"
+  local pod image
+  while IFS=$'\t' read -r pod image; do
+    [[ -n "$pod" && -n "$image" ]] || continue
+    if [[ "$image" != "$target_image" ]]; then
+      log "Force-removing superseded API pod $pod running $image..."
+      $K delete pod "$pod" --grace-period=0 --force --wait=false
+    fi
+  done < <(
+    $K get pods -l app=api \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].image}{"\n"}{end}'
+  )
+}
+
 create_secret_from_env() {
   log "Creating Kubernetes secrets from $ENV_FILE..."
 
@@ -257,8 +272,8 @@ deploy_cluster() {
       die "API replacement is unavailable; refusing to force-delete the old pod."
     fi
 
-    log "API replacement is available; clearing old pods still terminating after 30 seconds..."
-    cleanup_stale_terminating_api_pods 30
+    log "API replacement is available; clearing pods from superseded image revisions..."
+    cleanup_superseded_api_pods
     $K rollout status deployment/api --timeout=120s
   fi
   $K rollout status deployment/dashboard --timeout=180s
