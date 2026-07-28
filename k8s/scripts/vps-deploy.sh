@@ -31,7 +31,7 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 require_tools() {
-  for tool in docker k3s kubectl helm git sed grep; do
+  for tool in docker k3s kubectl helm git sed grep python3; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed or not on PATH"
   done
 
@@ -97,6 +97,40 @@ cleanup_superseded_api_pods() {
     $K get pods -l app=api \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].image}{"\n"}{end}'
   )
+}
+
+wait_for_target_api_replicas() {
+  local target_image="${IMAGE_PREFIX}/jh-api:${IMAGE_TAG}"
+  local desired deadline ready_count
+  desired="$($K get deployment api -o jsonpath='{.spec.replicas}')"
+  deadline=$((SECONDS + 120))
+
+  while (( SECONDS < deadline )); do
+    ready_count="$($K get pods -l app=api -o json | TARGET_IMAGE="$target_image" python3 -c '
+import json
+import os
+import sys
+
+target = os.environ["TARGET_IMAGE"]
+pods = json.load(sys.stdin).get("items", [])
+ready = 0
+for pod in pods:
+    images = [container.get("image") for container in pod.get("spec", {}).get("containers", [])]
+    conditions = pod.get("status", {}).get("conditions", [])
+    is_ready = any(item.get("type") == "Ready" and item.get("status") == "True" for item in conditions)
+    if target in images and not pod.get("metadata", {}).get("deletionTimestamp") and is_ready:
+        ready += 1
+print(ready)
+')"
+    if [[ "${ready_count:-0}" -ge "${desired:-1}" ]]; then
+      log "Target API image $target_image has ${ready_count}/${desired} Ready replicas."
+      return 0
+    fi
+    sleep 5
+  done
+
+  $K get pods -l app=api -o wide >&2
+  die "Target API image $target_image did not reach ${desired} Ready replicas."
 }
 
 create_secret_from_env() {
@@ -263,18 +297,12 @@ deploy_cluster() {
 
   log "Waiting for core app rollouts..."
   if ! $K rollout status deployment/api --timeout=60s; then
-    # The replacement must be serving before shortening an abnormally long
-    # termination. If it is not available, retain the old pod and fail safely.
-    local api_desired api_available
-    api_desired="$($K get deployment api -o jsonpath='{.spec.replicas}')"
-    api_available="$($K get deployment api -o jsonpath='{.status.availableReplicas}')"
-    if [[ "${api_available:-0}" -lt "${api_desired:-1}" ]]; then
-      die "API replacement is unavailable; refusing to force-delete the old pod."
-    fi
-
-    log "API replacement is available; clearing pods from superseded image revisions..."
+    # Confirm the target SHA itself is Ready. Deployment.availableReplicas can
+    # still refer to an old pod and is not a sufficient handoff safety check.
+    wait_for_target_api_replicas
+    log "Target API replacement is Ready; clearing superseded image revisions..."
     cleanup_superseded_api_pods
-    $K rollout status deployment/api --timeout=120s
+    wait_for_target_api_replicas
   fi
   $K rollout status deployment/dashboard --timeout=180s
   $K rollout status deployment/beat --timeout=180s
