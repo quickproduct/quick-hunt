@@ -396,6 +396,12 @@ verify_cluster() {
   log "Verifying deployed revision ${IMAGE_TAG}..."
 
   local unhealthy draining pod current_errors previous_errors restart_total
+  local runtime_failure_pattern
+  # Match emitted failure records, not documentation/configuration strings that
+  # merely mention words such as "CRITICAL" or "ImportError".  Structlog emits
+  # a JSON level field; Python, Celery, Node, Go, and PostgreSQL use the other
+  # anchored signatures below.
+  runtime_failure_pattern='("level"[[:space:]]*:[[:space:]]*"critical"|^CRITICAL([[:space:]:]|$)|^\[[^]]*:[[:space:]]*CRITICAL/|^\[[^]]+\][[:space:]]+CRITICAL([[:space:]:]|$)|^Traceback \(most recent call last\):|(^|[[:space:]])panic:|(^|[[:space:]])(SyntaxError|ModuleNotFoundError|ImportError):|UnhandledPromiseRejection|(^|[[:space:]])FATAL([[:space:]:]|$))'
   unhealthy="$($K get pods --no-headers | awk '$3 !~ /^(Running|Completed|Terminating)$/ {print}')"
   if [[ -n "$unhealthy" ]]; then
     echo "$unhealthy" >&2
@@ -417,8 +423,8 @@ verify_cluster() {
 
   log "Scanning recent pod logs for high-signal runtime failures (counts only)..."
   while IFS= read -r pod; do
-    current_errors="$($K logs "$pod" --all-containers --since=15m --tail=1000 2>/dev/null | grep -Eic 'Traceback|CRITICAL|panic:|SyntaxError|ModuleNotFoundError|ImportError|UnhandledPromiseRejection|FATAL' || true)"
-    previous_errors="$($K logs "$pod" --all-containers --previous --tail=500 2>/dev/null | grep -Eic 'Traceback|CRITICAL|panic:|SyntaxError|ModuleNotFoundError|ImportError|UnhandledPromiseRejection|FATAL' || true)"
+    current_errors="$($K logs "$pod" --all-containers --since=15m --tail=1000 2>/dev/null | grep -Eic "$runtime_failure_pattern" || true)"
+    previous_errors="$($K logs "$pod" --all-containers --previous --tail=500 2>/dev/null | grep -Eic "$runtime_failure_pattern" || true)"
     printf 'log-scan pod=%s current_high_signal=%s previous_high_signal=%s\n' \
       "$pod" "${current_errors:-0}" "${previous_errors:-0}"
   done < <($K get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
