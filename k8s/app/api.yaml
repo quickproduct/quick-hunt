@@ -26,6 +26,11 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
+          env:
+            # The API owns the mounted log files used by admin log endpoints.
+            # Workers log to stdout through the ConfigMap instead.
+            - name: LOG_TO_FILE
+              value: "true"
           envFrom:
             - configMapRef:
                 name: job-hunter-config

@@ -435,6 +435,7 @@ verify_cluster() {
   local unhealthy draining pod current_errors previous_errors restart_total
   local current_matches previous_matches current_signatures previous_signatures
   local current_exception_types previous_exception_types
+  local deletion_timestamp active_runtime_failures
   local runtime_failure_pattern traceback_exception_pattern
   # Match emitted failure records, not documentation/configuration strings that
   # merely mention words such as "CRITICAL" or "ImportError".  Structlog emits
@@ -442,6 +443,7 @@ verify_cluster() {
   # anchored signatures below.
   runtime_failure_pattern='("level"[[:space:]]*:[[:space:]]*"critical"|^CRITICAL([[:space:]:]|$)|^\[[^]]*:[[:space:]]*CRITICAL/|^\[[^]]+\][[:space:]]+CRITICAL([[:space:]:]|$)|^Traceback \(most recent call last\):|(^|[[:space:]])panic:|(^|[[:space:]])(SyntaxError|ModuleNotFoundError|ImportError):|UnhandledPromiseRejection|(^|[[:space:]])FATAL([[:space:]:]|$))'
   traceback_exception_pattern='^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Exit|Shutdown|TimeLimitExceeded):'
+  active_runtime_failures=0
   unhealthy="$($K get pods --no-headers | awk '$3 !~ /^(Running|Completed|Terminating)$/ {print}')"
   if [[ -n "$unhealthy" ]]; then
     echo "$unhealthy" >&2
@@ -471,11 +473,19 @@ verify_cluster() {
     previous_signatures="$(printf '%s\n' "$previous_matches" | summarize_runtime_failure_signatures)"
     current_exception_types="$($K logs "$pod" --all-containers --since=15m --tail=1000 2>/dev/null | grep -Eo "$traceback_exception_pattern" | sed 's/:$//' | sort -u | paste -sd, - || true)"
     previous_exception_types="$($K logs "$pod" --all-containers --previous --tail=500 2>/dev/null | grep -Eo "$traceback_exception_pattern" | sed 's/:$//' | sort -u | paste -sd, - || true)"
+    deletion_timestamp="$($K get pod "$pod" -o jsonpath='{.metadata.deletionTimestamp}')"
+    if [[ -z "$deletion_timestamp" && "${current_errors:-0}" -gt 0 ]]; then
+      active_runtime_failures=$((active_runtime_failures + current_errors))
+    fi
     printf 'log-scan pod=%s current_high_signal=%s current_signatures=%s current_exception_types=%s previous_high_signal=%s previous_signatures=%s previous_exception_types=%s\n' \
       "$pod" "${current_errors:-0}" "${current_signatures:-none}" \
       "${current_exception_types:-none}" "${previous_errors:-0}" \
       "${previous_signatures:-none}" "${previous_exception_types:-none}"
   done < <($K get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+
+  if [[ "$active_runtime_failures" -gt 0 ]]; then
+    die "Detected $active_runtime_failures high-signal runtime failure(s) in active pods."
+  fi
 }
 
 main() {
