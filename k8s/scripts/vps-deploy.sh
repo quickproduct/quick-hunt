@@ -395,12 +395,15 @@ deploy_cluster() {
 verify_cluster() {
   log "Verifying deployed revision ${IMAGE_TAG}..."
 
-  local unhealthy pod current_errors previous_errors restart_total
-  unhealthy="$($K get pods --no-headers | awk '$3 !~ /^(Running|Completed)$/ {print}')"
+  local unhealthy draining pod current_errors previous_errors restart_total
+  unhealthy="$($K get pods --no-headers | awk '$3 !~ /^(Running|Completed|Terminating)$/ {print}')"
   if [[ -n "$unhealthy" ]]; then
     echo "$unhealthy" >&2
-    die "One or more pods are not Running or Completed."
+    die "One or more pods are neither healthy nor gracefully terminating."
   fi
+
+  draining="$($K get pods --no-headers | awk '$3 == "Terminating" {count++} END {print count + 0}')"
+  log "Pods draining gracefully: $draining"
 
   $K exec deployment/api -- python -c \
     "import json, urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10)); assert data.get('status') in {'healthy', 'ok'}, data; print('API health:', data.get('status'))"
