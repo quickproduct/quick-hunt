@@ -12,6 +12,171 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  deploy-quickpulse:
+    name: Deploy QuickPulse to Hostinger Docker
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/deploy-quickpulse-vps'
+
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST || '200.141.0.224' }}
+      VPS_USER: ${{ secrets.VPS_USER || 'root' }}
+      VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+      QUICKPULSE_ADMIN_PASSWORD: ${{ secrets.QUICKPULSE_ADMIN_PASSWORD }}
+      QUICKPULSE_JWT_SECRET: ${{ secrets.QUICKPULSE_JWT_SECRET }}
+
+    steps:
+      - name: Install SSH password client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Inspect, deploy, and verify standalone QuickPulse
+        run: |
+          test -n "$VPS_PASSWORD"
+          test -n "$QUICKPULSE_ADMIN_PASSWORD"
+          test -n "$QUICKPULSE_JWT_SECRET"
+
+          sshpass -p "$VPS_PASSWORD" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            "$VPS_USER@$VPS_HOST" \
+            "QUICKPULSE_ADMIN_PASSWORD='$QUICKPULSE_ADMIN_PASSWORD' QUICKPULSE_JWT_SECRET='$QUICKPULSE_JWT_SECRET' bash -se" <<'REMOTE'
+          set -euo pipefail
+
+          echo "Connected to $(hostname)"
+          echo "Host capacity before deployment:"
+          free -h
+          df -h /
+          docker --version
+          docker compose version
+          k3s --version | head -1
+
+          echo "QuickHunt health before deployment:"
+          kubectl get --raw=/readyz
+          kubectl -n job-hunter get pods -o wide
+          before_unhealthy="$(kubectl -n job-hunter get pods --no-headers | awk '$3 != "Running" && $3 != "Completed" {count++} END {print count+0}')"
+
+          project_dir=""
+          for candidate in /root/quickpulse /root/quick-pulse /opt/quickpulse /opt/quick-pulse; do
+            if [[ -d "$candidate/.git" ]]; then
+              project_dir="$candidate"
+              break
+            fi
+          done
+          if [[ -z "$project_dir" ]]; then
+            project_dir="$(find /root /opt -maxdepth 4 -type d -name .git -print 2>/dev/null | while read -r git_dir; do
+              repo_dir="${git_dir%/.git}"
+              if git -C "$repo_dir" remote get-url origin 2>/dev/null | grep -q 'quick-pulse'; then
+                printf '%s\n' "$repo_dir"
+                break
+              fi
+            done)"
+          fi
+          if [[ -z "$project_dir" ]]; then
+            project_dir=/root/quickpulse
+            git clone --branch main https://github.com/quickproduct/quick-pulse.git "$project_dir"
+          fi
+
+          echo "Using QuickPulse checkout: $project_dir"
+          cd "$project_dir"
+          git status --short
+          if [[ -n "$(git status --porcelain=v1 --untracked-files=no)" ]]; then
+            echo "Tracked QuickPulse files are modified; refusing to overwrite them."
+            exit 1
+          fi
+          git fetch origin main
+          git checkout main
+          git pull --ff-only origin main
+          echo "QuickPulse revision: $(git rev-parse --short HEAD)"
+
+          if ss -ltn '( sport = :8082 )' | tail -n +2 | grep -q .; then
+            if ! docker ps --format '{{.Names}}' | grep -qx 'qp-app'; then
+              echo "Port 8082 is already occupied by a service other than qp-app."
+              ss -ltnp '( sport = :8082 )'
+              exit 1
+            fi
+          fi
+
+          install -d -m 700 /root/.kube
+          if [[ ! -f /root/.kube/config ]]; then
+            install -m 600 /etc/rancher/k3s/k3s.yaml /root/.kube/config
+          fi
+
+          if [[ ! -f .env ]]; then
+            cp .env.example .env
+          fi
+          chmod 600 .env
+          upsert_env() {
+            key="$1"
+            value="$2"
+            if grep -q "^${key}=" .env; then
+              sed -i "s|^${key}=.*|${key}=${value}|" .env
+            else
+              printf '%s=%s\n' "$key" "$value" >> .env
+            fi
+          }
+          upsert_env ENVIRONMENT production
+          upsert_env DEBUG false
+          upsert_env LOG_LEVEL INFO
+          upsert_env JWT_SECRET_KEY "$QUICKPULSE_JWT_SECRET"
+          upsert_env DEFAULT_ADMIN_EMAIL admin@quickpulse.local
+          upsert_env DEFAULT_ADMIN_PASSWORD "$QUICKPULSE_ADMIN_PASSWORD"
+          upsert_env ALLOW_REGISTRATION false
+          upsert_env EXTERNAL_FRONTEND_PORT 127.0.0.1:8082
+          upsert_env KUBECONFIG /root/.kube/config
+
+          docker compose config --quiet
+          docker compose up -d --build quickpulse
+
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail http://127.0.0.1:8082/health >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+              docker compose ps
+              docker compose logs --tail=200 quickpulse
+              exit 1
+            fi
+            sleep 3
+          done
+
+          health="$(curl --silent --fail http://127.0.0.1:8082/health)"
+          test "$health" = '{"status":"ok"}'
+
+          login_payload="$(python3 -c 'import json,os; print(json.dumps({"email":"admin@quickpulse.local","password":os.environ["QUICKPULSE_ADMIN_PASSWORD"]}))')"
+          login_response="$(curl --silent --fail -H 'Content-Type: application/json' -d "$login_payload" http://127.0.0.1:8082/api/v1/auth/login)"
+          access_token="$(printf '%s' "$login_response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+          test -n "$access_token"
+
+          docker_code="$(curl --silent --output /tmp/qp-docker-info.json --write-out '%{http_code}' -H "Authorization: Bearer $access_token" http://127.0.0.1:8082/api/v1/docker/info)"
+          k8s_code="$(curl --silent --output /tmp/qp-k8s-overview.json --write-out '%{http_code}' -H "Authorization: Bearer $access_token" http://127.0.0.1:8082/api/v1/kubernetes/overview)"
+          test "$docker_code" = 200
+          test "$k8s_code" = 200
+
+          python3 - <<'PY'
+          import json
+          with open('/tmp/qp-docker-info.json', encoding='utf-8') as handle:
+              docker = json.load(handle)
+          with open('/tmp/qp-k8s-overview.json', encoding='utf-8') as handle:
+              k8s = json.load(handle)
+          print('QuickPulse Docker API: connected')
+          print(f"QuickPulse K3s API: source={k8s.get('source')} nodes={k8s.get('nodes')} pods={k8s.get('pods_total')}")
+          PY
+
+          docker compose ps
+          docker inspect qp-app --format 'QuickPulse restart={{.HostConfig.RestartPolicy.Name}} memory={{.HostConfig.Memory}} nano_cpus={{.HostConfig.NanoCpus}}'
+          docker inspect qp-app --format '{{range .Mounts}}mount={{.Destination}} type={{.Type}} rw={{.RW}}{{println}}{{end}}'
+
+          echo "QuickHunt health after deployment:"
+          kubectl get --raw=/readyz
+          kubectl -n job-hunter get pods -o wide
+          after_unhealthy="$(kubectl -n job-hunter get pods --no-headers | awk '$3 != "Running" && $3 != "Completed" {count++} END {print count+0}')"
+          test "$after_unhealthy" -le "$before_unhealthy"
+
+          echo "QuickPulse deployment verified successfully on 127.0.0.1:8082"
+          REMOTE
+
   syntax-check:
     name: Step 1 - Syntax Check
     runs-on: ubuntu-latest
