@@ -129,19 +129,26 @@ jobs:
           docker compose config --quiet
           docker compose up -d --build quickpulse
 
-          for attempt in $(seq 1 30); do
+          consecutive_healthy=0
+          for attempt in $(seq 1 40); do
             if curl --silent --fail http://127.0.0.1:8082/health >/dev/null; then
-              break
+              consecutive_healthy=$((consecutive_healthy + 1))
+              if [[ "$consecutive_healthy" -ge 3 ]]; then
+                break
+              fi
+            else
+              consecutive_healthy=0
             fi
-            if [[ "$attempt" -eq 30 ]]; then
+            if [[ "$attempt" -eq 40 ]]; then
               docker compose ps
+              docker inspect qp-app --format 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} error={{.State.Error}}'
               docker compose logs --tail=200 quickpulse
               exit 1
             fi
             sleep 3
           done
 
-          health="$(curl --silent --fail http://127.0.0.1:8082/health)"
+          health="$(curl --silent --show-error --fail --retry 5 --retry-all-errors --retry-delay 2 http://127.0.0.1:8082/health)"
           test "$health" = '{"status":"ok"}'
 
           login_payload="$(python3 -c 'import json,os; print(json.dumps({"email":"admin@quickpulse.local","password":os.environ["QUICKPULSE_ADMIN_PASSWORD"]}))')"
