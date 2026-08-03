@@ -285,9 +285,14 @@ async def approve_application(
     }
 
 
+MAX_DIRECT_SEND_EMAILS = 1000
+
+
 class DirectSendRequest(BaseModel):
     candidate_id: str
-    hr_emails: list[EmailStr] = Field(..., min_length=1, max_length=100)
+    hr_emails: list[EmailStr] = Field(
+        ..., min_length=1, max_length=MAX_DIRECT_SEND_EMAILS
+    )
 
 
 class DirectSendResult(BaseModel):
