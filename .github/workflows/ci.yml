@@ -127,7 +127,13 @@ jobs:
           upsert_env KUBECONFIG /root/.kube/config
 
           docker compose config --quiet
-          docker compose up -d --build quickpulse
+          if docker inspect qp-app --format '{{.State.Status}}' 2>/dev/null | grep -qx running; then
+            echo "QuickPulse is already running; preserving the live container for stability verification."
+          else
+            docker compose up -d --build quickpulse
+          fi
+
+          restart_count_before="$(docker inspect qp-app --format '{{.RestartCount}}')"
 
           consecutive_healthy=0
           for attempt in $(seq 1 40); do
@@ -150,6 +156,14 @@ jobs:
 
           health="$(curl --silent --show-error --fail --retry 5 --retry-all-errors --retry-delay 2 http://127.0.0.1:8082/health)"
           test "$health" = '{"status":"ok"}'
+
+          sleep 30
+          container_state="$(docker inspect qp-app --format '{{.State.Status}} {{.State.OOMKilled}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{end}}')"
+          read -r state oom_killed restart_count_after health_status <<<"$container_state"
+          test "$state" = running
+          test "$oom_killed" = false
+          test "$restart_count_after" = "$restart_count_before"
+          test "$health_status" = healthy
 
           login_payload="$(python3 -c 'import json,os; print(json.dumps({"email":"admin@quickpulse.local","password":os.environ["QUICKPULSE_ADMIN_PASSWORD"]}))')"
           login_response="$(curl --silent --fail -H 'Content-Type: application/json' -d "$login_payload" http://127.0.0.1:8082/api/v1/auth/login)"
