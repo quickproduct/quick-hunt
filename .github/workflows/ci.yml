@@ -124,7 +124,7 @@ jobs:
           upsert_env DEFAULT_ADMIN_EMAIL admin@quickpulse.local
           upsert_env DEFAULT_ADMIN_PASSWORD "$QUICKPULSE_ADMIN_PASSWORD"
           upsert_env ALLOW_REGISTRATION false
-          upsert_env EXTERNAL_FRONTEND_PORT 127.0.0.1:8082
+          upsert_env EXTERNAL_FRONTEND_PORT 8082
           upsert_env KUBECONFIG /root/.kube/config
 
           cat > docker-compose.vps.yml <<'YAML'
@@ -142,10 +142,15 @@ jobs:
           if docker inspect qp-app >/dev/null 2>&1; then
             docker inspect qp-app --format 'Pre-deploy QuickPulse state: status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} health={{if .State.Health}}{{.State.Health.Status}}{{end}} memory={{.HostConfig.Memory}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}'
           fi
-          if [[ "$(docker inspect qp-app --format '{{.State.Status}} {{.HostConfig.Memory}}' 2>/dev/null || true)" = "running 268435456" ]]; then
+          public_binding="$(docker port qp-app 8000/tcp 2>/dev/null || true)"
+          if [[ "$(docker inspect qp-app --format '{{.State.Status}} {{.HostConfig.Memory}}' 2>/dev/null || true)" = "running 268435456" ]] && grep -qx '0.0.0.0:8082' <<<"$public_binding"; then
             echo "QuickPulse is already running; preserving the live container for stability verification."
           else
             docker compose up -d --build quickpulse
+          fi
+
+          if command -v ufw >/dev/null 2>&1; then
+            ufw allow 8082/tcp comment 'QuickPulse monitor'
           fi
 
           restart_count_before="$(docker inspect qp-app --format '{{.RestartCount}}')"
@@ -212,8 +217,18 @@ jobs:
           after_unhealthy="$(kubectl -n job-hunter get pods --no-headers | awk '$3 != "Running" && $3 != "Completed" {count++} END {print count+0}')"
           test "$after_unhealthy" -le "$before_unhealthy"
 
-          echo "QuickPulse deployment verified successfully on 127.0.0.1:8082"
+          echo "QuickPulse deployment verified successfully on public port 8082"
           REMOTE
+
+          for attempt in $(seq 1 12); do
+            if curl --silent --fail --connect-timeout 5 "http://$VPS_HOST:8082/health" | grep -q '"status":"ok"'; then
+              echo "External QuickPulse health check passed at http://$VPS_HOST:8082/health"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "QuickPulse is healthy locally but public port 8082 is not reachable from the runner."
+          exit 1
 
   syntax-check:
     name: Step 1 - Syntax Check
