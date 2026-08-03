@@ -51,7 +51,7 @@ jobs:
           df -h /
           docker --version
           docker compose version
-          k3s --version | head -1
+          k3s --version
 
           echo "QuickHunt health before deployment:"
           kubectl get --raw=/readyz
