@@ -38,6 +38,7 @@ jobs:
 
           sshpass -p "$VPS_PASSWORD" ssh \
             -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=20 \
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=10 \
             "$VPS_USER@$VPS_HOST" \
@@ -134,6 +135,7 @@ jobs:
           fi
 
           restart_count_before="$(docker inspect qp-app --format '{{.RestartCount}}')"
+          docker inspect qp-app --format 'Initial QuickPulse state: status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} health={{if .State.Health}}{{.State.Health.Status}}{{end}} started={{.State.StartedAt}}'
 
           consecutive_healthy=0
           for attempt in $(seq 1 40); do
