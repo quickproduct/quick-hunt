@@ -127,8 +127,22 @@ jobs:
           upsert_env EXTERNAL_FRONTEND_PORT 127.0.0.1:8082
           upsert_env KUBECONFIG /root/.kube/config
 
+          cat > docker-compose.vps.yml <<'YAML'
+          services:
+            quickpulse:
+              deploy:
+                resources:
+                  limits:
+                    cpus: '0.25'
+                    memory: 256m
+          YAML
+          export COMPOSE_FILE=docker-compose.yml:docker-compose.vps.yml
+
           docker compose config --quiet
-          if docker inspect qp-app --format '{{.State.Status}}' 2>/dev/null | grep -qx running; then
+          if docker inspect qp-app >/dev/null 2>&1; then
+            docker inspect qp-app --format 'Pre-deploy QuickPulse state: status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} health={{if .State.Health}}{{.State.Health.Status}}{{end}} memory={{.HostConfig.Memory}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}'
+          fi
+          if [[ "$(docker inspect qp-app --format '{{.State.Status}} {{.HostConfig.Memory}}' 2>/dev/null || true)" = "running 268435456" ]]; then
             echo "QuickPulse is already running; preserving the live container for stability verification."
           else
             docker compose up -d --build quickpulse
@@ -161,6 +175,7 @@ jobs:
 
           sleep 30
           container_state="$(docker inspect qp-app --format '{{.State.Status}} {{.State.OOMKilled}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{end}}')"
+          echo "Stable QuickPulse state: $container_state"
           read -r state oom_killed restart_count_after health_status <<<"$container_state"
           test "$state" = running
           test "$oom_killed" = false
